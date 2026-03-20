@@ -73,7 +73,10 @@ class MediaTableModel(QAbstractTableModel):
             return values[col]
 
         if role == Qt.BackgroundRole and row.is_inconsistent:
-            return QColor("#fff59d")
+            return QColor("#ffcc80")
+
+        if role == Qt.ForegroundRole and row.is_inconsistent:
+            return QColor("#000000")  # siyah yazı
 
         if role == Qt.TextAlignmentRole and col == 6:
             return int(Qt.AlignRight | Qt.AlignVCenter)
