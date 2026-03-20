@@ -1,0 +1,1 @@
+python src\fixInconsistentFiles.py "E:\Resimler\2019" --check "folder,filename,metadata,filesystem" --fix-metadata --dry-run

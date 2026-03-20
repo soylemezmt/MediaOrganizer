@@ -1,0 +1,2 @@
+# No external Python packages required.
+# ExifTool must be installed separately and available in PATH.

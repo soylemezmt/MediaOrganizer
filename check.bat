@@ -1,0 +1,1 @@
+python src\findInconsistentFiles.py "E:\Resimler\2019" --check "folder,filename,metadata" --compare-level month --report-all

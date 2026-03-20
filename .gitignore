@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+logs/
+organize_log.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Executables
+*.exe
+*.dll
+*.so
+
+# Resources
+resources/
+
+#package
+*.pak
+
+# Build files
+build/
+dist/
+
+.venv/
