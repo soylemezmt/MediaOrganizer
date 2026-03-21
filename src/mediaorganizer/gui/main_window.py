@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import shutil
 import subprocess
 import sys
@@ -9,10 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QStandardPaths
-from PySide6.QtGui import QAction, QPixmap
+from send2trash import send2trash
+
+from PySide6.QtCore import Qt, QThread, QStandardPaths, QTimer
+from PySide6.QtGui import QAction, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -29,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStyledItemDelegate,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -42,6 +47,16 @@ from .utils import fmt_year_month
 from ..consistency import analyze_date_consistency, get_all_date_sources
 from ..metadata_reader import read_metadata_dates_with_exiftool
 from ..naming import resolve_destination_path
+
+
+class FileNameEditDelegate(QStyledItemDelegate):
+    def __init__(self, owner, parent=None) -> None:
+        super().__init__(parent)
+        self.owner = owner
+
+    def setModelData(self, editor, model, index) -> None:
+        new_name = editor.text().strip()
+        self.owner.rename_selected_file_from_editor(index, new_name)
 
 
 class MainWindow(QMainWindow):
@@ -67,6 +82,9 @@ class MainWindow(QMainWindow):
         self.current_info_path: Optional[Path] = None
         self.current_preview_video_path: Optional[Path] = None
         self.thumbnail_cache: dict[Path, Optional[Path]] = {}
+        
+        self._last_media_clicked_row: Optional[int] = None
+        self._last_media_click_ts: float = 0.0
 
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath("")
@@ -78,6 +96,7 @@ class MainWindow(QMainWindow):
         self.folder_list = FolderListTable()
         self.folder_list.selection_paths_changed.connect(self.on_folder_selection_changed)
         self.folder_list.folder_activated.connect(self.set_folder)
+        self.folder_list.folder_rename_requested.connect(self.rename_folder)
 
         self.recursive_checkbox = QCheckBox("Include subfolders")
         self.recursive_checkbox.setChecked(False)
@@ -85,6 +104,7 @@ class MainWindow(QMainWindow):
 
         self.media_table_model = MediaTableModel()
         self.media_table = QTableView()
+        self.media_table.setItemDelegateForColumn(0, FileNameEditDelegate(self, self.media_table))
         self.media_table.setModel(self.media_table_model)
         self.media_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.media_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -93,6 +113,11 @@ class MainWindow(QMainWindow):
         self.media_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.media_table.horizontalHeader().setStretchLastSection(True)
         self.media_table.selectionModel().selectionChanged.connect(self.on_media_selection_changed)
+        self.media_table.clicked.connect(self.on_media_table_clicked)
+        
+        self.delete_shortcut = QShortcut(QKeySequence.Delete, self.media_table)
+        self.delete_shortcut.setContext(Qt.WidgetShortcut)
+        self.delete_shortcut.activated.connect(self.delete_selected_files)
 
         self.preview_label = QLabel("Preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -273,6 +298,60 @@ class MainWindow(QMainWindow):
             "user_defined": "User Defined",
         }
         return labels.get(key, key)
+
+    def delete_selected_files(self) -> None:
+        selected_paths = self.selected_file_paths()
+        if not selected_paths:
+            return
+
+        selected_rows = sorted(idx.row() for idx in self.media_table.selectionModel().selectedRows())
+        preferred_row = selected_rows[0] if selected_rows else 0
+
+        if len(selected_paths) > 1:
+            reply = QMessageBox.question(
+                self,
+                "Delete Files",
+                f"Send {len(selected_paths)} selected files to Recycle Bin?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        errors: list[str] = []
+        deleted_paths: list[Path] = []
+
+        for path in selected_paths:
+            try:
+                send2trash(str(path))
+                deleted_paths.append(path)
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+
+        if deleted_paths:
+            if len(deleted_paths) <= 50:
+                self.incremental_refresh_files(deleted_paths, [])
+            else:
+                self.refresh_selected_folders()
+
+            self.clear_details_panel()
+            self.preview_label.setText("Preview")
+            self.preview_label.setPixmap(QPixmap())
+
+            row_count = self.media_table_model.rowCount()
+            if row_count > 0:
+                row_to_select = preferred_row if preferred_row < row_count else 0
+                self.media_table.selectRow(row_to_select)
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete completed with errors",
+                "\n".join(errors[:20]),
+            )
+        elif deleted_paths:
+            self.statusBar().showMessage(f"{len(deleted_paths)} file(s) sent to Recycle Bin.")
+
 
     def move_priority_item(self, delta: int) -> None:
         row = self.priority_list.currentRow()
@@ -602,6 +681,95 @@ class MainWindow(QMainWindow):
         self.current_info_path = first_path
         self.show_preview(first_path)
         self.populate_details_panel(first_path)
+
+    def on_media_table_clicked(self, index) -> None:
+        if not index.isValid() or index.column() != 0:
+            return
+
+        modifiers = QApplication.keyboardModifiers()
+        row = index.row()
+        now = time.monotonic()
+
+        if modifiers & (Qt.ControlModifier | Qt.ShiftModifier):
+            self._last_media_clicked_row = row
+            self._last_media_click_ts = now
+            return
+
+        same_row = (self._last_media_clicked_row == row)
+        delta = now - self._last_media_click_ts
+
+        if same_row and 0.4 <= delta <= 1.5:
+            if self.media_table.selectionModel().isRowSelected(row, self.media_table.rootIndex()):
+                if self.media_table.state() != QAbstractItemView.EditingState:
+                    self.media_table.edit(index)
+
+        self._last_media_clicked_row = row
+        self._last_media_click_ts = now
+        
+
+    def rename_folder(self, old_path: Path, new_name: str) -> None:
+        new_name = new_name.strip()
+        if not new_name:
+            self.folder_list.revert_row_text(old_path)
+            return
+
+        if new_name in {".", ".."}:
+            self.folder_list.revert_row_text(old_path)
+            return
+
+        try:
+            target_path = old_path.with_name(new_name)
+            if target_path.exists():
+                raise FileExistsError(f"Folder already exists: {target_path.name}")
+
+            new_path = old_path.rename(target_path)
+
+            if self.current_folder is not None:
+                self.folder_list.set_folder_entries(self.current_folder)
+
+            for row in range(self.folder_list.rowCount()):
+                item = self.folder_list.item(row, 0)
+                if item is not None and item.text() == new_path.name:
+                    self.folder_list.selectRow(row)
+                    break
+
+            self.statusBar().showMessage(f"Folder renamed to: {new_path.name}")
+        except Exception as exc:
+            self.folder_list.revert_row_text(old_path)
+            QMessageBox.warning(self, "Rename Folder", f"Could not rename folder:\n{exc}")
+
+    def rename_selected_file_from_editor(self, index, new_name: str) -> None:
+        if not index.isValid():
+            return
+
+        row = index.row()
+        rel_path = self.media_table_model.get_path(row)
+        if rel_path is None:
+            return
+
+        old_path = self.current_folder / rel_path if self.current_folder is not None and not rel_path.is_absolute() else rel_path
+        new_name = new_name.strip()
+
+        if not new_name or new_name == old_path.name:
+            self.refresh_selected_folders()
+            return
+
+        try:
+            target_path = old_path.with_name(new_name)
+            if target_path.exists():
+                raise FileExistsError(f"File already exists: {target_path.name}")
+
+            new_path = old_path.rename(target_path)
+
+            if len(self.selected_file_paths()) <= 50:
+                self.incremental_refresh_files([old_path], [new_path])
+            else:
+                self.refresh_selected_folders()
+
+            self.statusBar().showMessage(f"File renamed to: {new_path.name}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Rename File", f"Could not rename file:\n{exc}")
+            self.refresh_selected_folders()
 
     def position_play_overlay(self) -> None:
         btn = self.play_overlay_button

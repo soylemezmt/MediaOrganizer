@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -59,7 +59,7 @@ class MediaTableModel(QAbstractTableModel):
         row = self.rows[index.row()]
         col = index.column()
 
-        if role == Qt.DisplayRole:
+        if role in (Qt.DisplayRole, Qt.EditRole):
             values = [
                 row.path.name,
                 row.file_type,
@@ -82,6 +82,36 @@ class MediaTableModel(QAbstractTableModel):
             return int(Qt.AlignRight | Qt.AlignVCenter)
 
         return None
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.NoItemFlags
+
+        flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        if index.column() == 0:
+            flags |= Qt.ItemIsEditable
+        return flags
+
+    def setData(self, index: QModelIndex, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid() or index.column() != 0:
+            return False
+
+        new_name = str(value).strip()
+        if not new_name:
+            return False
+
+        row_index = index.row()
+        row = self.rows[row_index]
+        if new_name == row.path.name:
+            return False
+
+        new_path = row.path.with_name(new_name)
+        self.rows[row_index] = replace(row, path=new_path)
+
+        left = self.index(row_index, 0)
+        right = self.index(row_index, self.columnCount() - 1)
+        self.dataChanged.emit(left, right)
+        return True
 
     def get_path(self, row_index: int) -> Optional[Path]:
         if 0 <= row_index < len(self.rows):
@@ -118,8 +148,3 @@ class MediaTableModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), insert_at, insert_at)
         self.rows.insert(insert_at, new_row)
         self.endInsertRows()
-
-    def sort_rows(self) -> None:
-        self.beginResetModel()
-        self.rows.sort(key=lambda r: str(r.path).lower())
-        self.endResetModel()
