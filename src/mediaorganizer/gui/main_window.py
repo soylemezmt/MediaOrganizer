@@ -14,12 +14,16 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFileSystemModel,
     QFormLayout,
     QGroupBox,
     QHeaderView,
+    QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -29,20 +33,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import MediaTableModel, MediaRow
-from .utils import fmt_year_month
-from ..consistency import get_all_date_sources, analyze_date_consistency
+from .folderListTable import FolderListTable
+from .models import MediaRow, MediaTableModel
 from .scanner import FolderScanner
+from .updatePreview import UpdatePreviewDialog
+from .utils import fmt_year_month
+from ..consistency import analyze_date_consistency, get_all_date_sources
 from ..metadata_reader import read_metadata_dates_with_exiftool
 from ..naming import resolve_destination_path
-from PySide6.QtWidgets import QDialog
-from .updatePreview import UpdatePreviewDialog
-from .folderListTable import FolderListTable
-
 
 
 class MainWindow(QMainWindow):
-    DEFAULT_PRIORITY = ["folder", "filename", "metadata", "filesystem"]
+    DEFAULT_PRIORITY = ["metadata", "filename", "folder", "filesystem", "user_defined"]
 
     def __init__(self) -> None:
         super().__init__()
@@ -106,22 +108,63 @@ class MainWindow(QMainWindow):
         self.preview_changes_check = QCheckBox("Preview changes before update")
         self.preview_changes_check.setChecked(True)
 
+        self.priority_list = QListWidget()
+        self.priority_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.priority_list.setMinimumHeight(120)
+
+        self.priority_up_button = QPushButton("↑")
+        self.priority_down_button = QPushButton("↓")
+        self.priority_up_button.setFixedWidth(40)
+        self.priority_down_button.setFixedWidth(40)
+        self.priority_up_button.clicked.connect(lambda: self.move_priority_item(-1))
+        self.priority_down_button.clicked.connect(lambda: self.move_priority_item(+1))
+        self._load_default_priority()
+
         self.selection_count_label = QLabel("You have not selected a file")
 
         self.update_button = QPushButton("Update")
         self.update_button.clicked.connect(self.update_selected_files)
 
         self.details_group = QGroupBox("Selected File Details")
-        details_layout = QFormLayout(self.details_group)
-        details_layout.addRow(self.metadata_check, self.metadata_value_label)
-        details_layout.addRow(self.filename_check, self.filename_value_label)
-        details_layout.addRow(self.folder_check, self.folder_value_label)
-        details_layout.addRow(self.filesystem_check, self.filesystem_value_label)
-        details_layout.addRow("Year", self.year_combo)
-        details_layout.addRow("Month", self.month_combo)
-        details_layout.addRow(self.preview_changes_check)
-        details_layout.addRow(self.selection_count_label)
-        details_layout.addRow(self.update_button)
+        details_layout = QVBoxLayout(self.details_group)
+
+        # Sol üst: update checkbox paneli
+        update_group = QGroupBox("Update Targets")
+        update_layout = QFormLayout(update_group)
+        update_layout.addRow(self.metadata_check, self.metadata_value_label)
+        update_layout.addRow(self.filename_check, self.filename_value_label)
+        update_layout.addRow(self.folder_check, self.folder_value_label)
+        update_layout.addRow(self.filesystem_check, self.filesystem_value_label)
+
+        # Sağ üst: priority paneli
+        priority_group = QGroupBox("Date Source Priority")
+
+        priority_buttons_layout = QVBoxLayout()
+        priority_buttons_layout.addWidget(self.priority_up_button)
+        priority_buttons_layout.addWidget(self.priority_down_button)
+        priority_buttons_layout.addStretch(1)
+
+        priority_inner_layout = QHBoxLayout()
+        priority_inner_layout.addWidget(self.priority_list, 1)
+        priority_inner_layout.addLayout(priority_buttons_layout)
+
+        priority_group.setLayout(priority_inner_layout)
+
+        # Üst kısım: iki panel yan yana
+        top_panels_layout = QHBoxLayout()
+        top_panels_layout.addWidget(update_group, 1)
+        top_panels_layout.addWidget(priority_group, 1)
+
+        # Alt kısım: tarih, preview, bilgi ve update
+        bottom_form = QFormLayout()
+        bottom_form.addRow("Year", self.year_combo)
+        bottom_form.addRow("Month", self.month_combo)
+        bottom_form.addRow(self.preview_changes_check)
+        bottom_form.addRow(self.selection_count_label)
+        bottom_form.addRow(self.update_button)
+
+        details_layout.addLayout(top_panels_layout)
+        details_layout.addLayout(bottom_form)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -182,6 +225,60 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+    def _load_default_priority(self) -> None:
+        self.priority_list.clear()
+        for key in self.DEFAULT_PRIORITY:
+            item = QListWidgetItem(self._priority_label(key))
+            item.setData(Qt.UserRole, key)
+            self.priority_list.addItem(item)
+        if self.priority_list.count() > 0:
+            self.priority_list.setCurrentRow(0)
+
+    def _priority_label(self, key: str) -> str:
+        labels = {
+            "metadata": "Metadata",
+            "filename": "Filename",
+            "folder": "Folder",
+            "filesystem": "Filesystem",
+            "user_defined": "User Defined",
+        }
+        return labels.get(key, key)
+
+    def move_priority_item(self, delta: int) -> None:
+        row = self.priority_list.currentRow()
+        if row < 0:
+            return
+
+        new_row = row + delta
+        if new_row < 0 or new_row >= self.priority_list.count():
+            return
+
+        item = self.priority_list.takeItem(row)
+        self.priority_list.insertItem(new_row, item)
+        self.priority_list.setCurrentRow(new_row)
+
+    def get_priority_order(self) -> list[str]:
+        order: list[str] = []
+        for i in range(self.priority_list.count()):
+            item = self.priority_list.item(i)
+            order.append(item.data(Qt.UserRole))
+        return order
+
+    def get_user_defined_date(self) -> datetime:
+        year = int(self.year_combo.currentText())
+        month = int(self.month_combo.currentText())
+        return datetime(year, month, 1, 12, 0, 0)
+
+    def choose_date_by_priority(self, dates: dict) -> tuple[Optional[datetime], Optional[str]]:
+        candidates = dict(dates)
+        candidates["user_defined"] = self.get_user_defined_date()
+
+        for key in self.get_priority_order():
+            dt = candidates.get(key)
+            if dt is not None:
+                return dt, key
+        return None, None
 
     def _to_display_path(self, path: Path) -> Path:
         if self.current_folder is not None:
@@ -251,11 +348,8 @@ class MainWindow(QMainWindow):
 
     def incremental_refresh_files(self, old_paths: list[Path], new_paths: list[Path]) -> None:
         old_display_paths = [self._to_display_path(p) for p in old_paths]
-
-        # Önce eski satırları kaldır
         self.media_table_model.remove_paths(old_display_paths)
 
-        # Sonra halen görünümde olması gereken yeni dosyaları tekrar ekle
         for path in new_paths:
             if not self._is_path_in_current_view(path):
                 continue
@@ -319,7 +413,6 @@ class MainWindow(QMainWindow):
                         count += 1
         return count
 
-
     def refresh_current_folder(self) -> None:
         if self.current_folder is not None:
             self.folder_list.set_folder_entries(self.current_folder)
@@ -358,11 +451,9 @@ class MainWindow(QMainWindow):
             return
 
         recursive = self.recursive_checkbox.isChecked()
-        # If "." is selected and recursive mode is on, ignore other selected subfolders
-        if recursive and self.current_folder is not None:
-            if self.current_folder in selected_paths:
-                selected_paths = [self.current_folder]
-                
+        if recursive and self.current_folder is not None and self.current_folder in selected_paths:
+            selected_paths = [self.current_folder]
+
         try:
             estimated_count = self.estimate_selected_file_count(selected_paths, recursive)
         except Exception:
@@ -496,11 +587,8 @@ class MainWindow(QMainWindow):
         return get_all_date_sources(path, metadata_map.get(path))
 
     def choose_default_date(self, dates: dict) -> Optional[datetime]:
-        for key in self.DEFAULT_PRIORITY:
-            dt = dates.get(key)
-            if dt is not None:
-                return dt
-        return None
+        dt, _ = self.choose_date_by_priority(dates)
+        return dt
 
     def build_update_plan(
         self,
@@ -512,17 +600,21 @@ class MainWindow(QMainWindow):
         do_folder: bool,
         do_filesystem: bool,
     ) -> list[dict]:
-        target_dt = datetime(year, month, 1, 12, 0, 0)
         plan = []
 
         for source_path in selected_paths:
             old_dates = self.get_dates_for_path(source_path)
+            target_dt, source_key = self.choose_date_by_priority(old_dates)
+
+            if target_dt is None:
+                continue
 
             old_value = (
                 f"metadata={self._fmt_year_month(old_dates.get('metadata'))}, "
                 f"filename={self._fmt_year_month(old_dates.get('filename'))}, "
                 f"folder={self._fmt_year_month(old_dates.get('folder'))}, "
-                f"filesystem={self._fmt_year_month(old_dates.get('filesystem'))}"
+                f"filesystem={self._fmt_year_month(old_dates.get('filesystem'))}, "
+                f"user_defined={self._fmt_year_month(self.get_user_defined_date())}"
             )
 
             new_name = source_path.name
@@ -531,7 +623,7 @@ class MainWindow(QMainWindow):
 
             new_folder = str(source_path.parent)
             if do_folder and self.current_folder is not None:
-                new_folder = str(self.current_folder / f"{year:04d}" / f"{month:02d}")
+                new_folder = str(self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}")
 
             fields = []
             if do_metadata:
@@ -543,7 +635,11 @@ class MainWindow(QMainWindow):
             if do_filesystem:
                 fields.append("filesystem")
 
-            new_value = f"date={year:04d}-{month:02d}, name={new_name}, folder={new_folder}"
+            new_value = (
+                f"date={target_dt.year:04d}-{target_dt.month:02d}, "
+                f"source={self._priority_label(source_key)}, "
+                f"name={new_name}, folder={new_folder}"
+            )
 
             plan.append(
                 {
@@ -564,7 +660,6 @@ class MainWindow(QMainWindow):
 
         year = int(self.year_combo.currentText())
         month = int(self.month_combo.currentText())
-        target_dt = datetime(year, month, 1, 12, 0, 0)
 
         do_metadata = self.metadata_check.isChecked()
         do_filename = self.filename_check.isChecked()
@@ -584,10 +679,19 @@ class MainWindow(QMainWindow):
                 return
 
         errors: list[str] = []
+        old_paths: list[Path] = []
+        new_paths: list[Path] = []
 
         for source_path in selected_paths:
+            old_paths.append(source_path)
             try:
                 current_path = source_path
+                dates = self.get_dates_for_path(source_path)
+                target_dt, source_key = self.choose_date_by_priority(dates)
+
+                if target_dt is None:
+                    errors.append(f"{source_path.name}: no usable date found")
+                    continue
 
                 if do_filename:
                     new_name = self.build_updated_filename(current_path.name, target_dt)
@@ -617,10 +721,15 @@ class MainWindow(QMainWindow):
                 if do_filesystem:
                     self.write_filesystem_time(current_path, target_dt)
 
+                new_paths.append(current_path)
+
             except Exception as exc:
                 errors.append(f"{source_path.name}: {exc}")
 
-        self.refresh_selected_folders()
+        if len(old_paths) <= 50:
+            self.incremental_refresh_files(old_paths, new_paths)
+        else:
+            self.refresh_selected_folders()
 
         if errors:
             QMessageBox.warning(self, "Update completed with errors", "\n".join(errors[:20]))
@@ -638,10 +747,10 @@ class MainWindow(QMainWindow):
         d = "01"
 
         patterns = [
-            (r'(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)', f"{y}{m}{d}"),
-            (r'(?<!\d)(20\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)', f"{y}-{m}-{d}"),
-            (r'(?<!\d)(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})(?!\d)', f"{y}-{m}-{d}"),
-            (r'(?<!\d)(20\d{2})[-_.](\d{2})(?!\d)', f"{y}-{m}"),
+            (r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", f"{y}{m}{d}"),
+            (r"(?<!\d)(20\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)", f"{y}-{m}-{d}"),
+            (r"(?<!\d)(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})(?!\d)", f"{y}-{m}-{d}"),
+            (r"(?<!\d)(20\d{2})[-_.](\d{2})(?!\d)", f"{y}-{m}"),
         ]
 
         for pattern, replacement in patterns:
