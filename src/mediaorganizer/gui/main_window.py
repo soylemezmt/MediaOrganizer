@@ -29,9 +29,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import MediaTableModel
+from .models import MediaTableModel, MediaRow
+from .utils import fmt_year_month
+from ..consistency import get_all_date_sources, analyze_date_consistency
 from .scanner import FolderScanner
-from ..consistency import get_all_date_sources
 from ..metadata_reader import read_metadata_dates_with_exiftool
 from ..naming import resolve_destination_path
 from PySide6.QtWidgets import QDialog
@@ -182,6 +183,95 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+    def _to_display_path(self, path: Path) -> Path:
+        if self.current_folder is not None:
+            try:
+                return path.relative_to(self.current_folder)
+            except Exception:
+                pass
+        return path
+
+    def _is_path_in_current_view(self, path: Path) -> bool:
+        selected_paths = self.folder_list.selected_folder_paths()
+        if not selected_paths:
+            return False
+
+        recursive = self.recursive_checkbox.isChecked()
+
+        if recursive and self.current_folder is not None and self.current_folder in selected_paths:
+            selected_paths = [self.current_folder]
+
+        try:
+            path_resolved = path.resolve()
+        except Exception:
+            path_resolved = path
+
+        for folder in selected_paths:
+            try:
+                folder_resolved = folder.resolve()
+            except Exception:
+                folder_resolved = folder
+
+            if recursive:
+                try:
+                    path_resolved.relative_to(folder_resolved)
+                    return True
+                except Exception:
+                    pass
+            else:
+                if path_resolved.parent == folder_resolved:
+                    return True
+
+        return False
+
+    def _build_media_row_for_path(self, path: Path) -> Optional[MediaRow]:
+        if not path.exists() or not path.is_file():
+            return None
+
+        metadata_map = read_metadata_dates_with_exiftool([path])
+        dates = get_all_date_sources(path, metadata_map.get(path))
+        is_inconsistent, *_ = analyze_date_consistency(
+            dates=dates,
+            checked_sources=["metadata", "filename", "folder", "filesystem"],
+            compare_level="month",
+        )
+
+        display_path = self._to_display_path(path)
+
+        return MediaRow(
+            path=display_path,
+            file_type=path.suffix.lower(),
+            metadata_date=fmt_year_month(dates.get("metadata")),
+            filename_date=fmt_year_month(dates.get("filename")),
+            folder_date=fmt_year_month(dates.get("folder")),
+            filesystem_date=fmt_year_month(dates.get("filesystem")),
+            size_bytes=path.stat().st_size,
+            is_inconsistent=is_inconsistent,
+        )
+
+    def incremental_refresh_files(self, old_paths: list[Path], new_paths: list[Path]) -> None:
+        old_display_paths = [self._to_display_path(p) for p in old_paths]
+
+        # Önce eski satırları kaldır
+        self.media_table_model.remove_paths(old_display_paths)
+
+        # Sonra halen görünümde olması gereken yeni dosyaları tekrar ekle
+        for path in new_paths:
+            if not self._is_path_in_current_view(path):
+                continue
+
+            row = self._build_media_row_for_path(path)
+            if row is None:
+                continue
+
+            existing_index = self.media_table_model.find_row_by_path(row.path)
+            if existing_index >= 0:
+                self.media_table_model.update_row(existing_index, row)
+            else:
+                self.media_table_model.insert_row_sorted(row)
+
+        self.statusBar().showMessage(f"Updated {len(new_paths)} file(s) incrementally.")
+
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if not folder:
@@ -300,17 +390,21 @@ class MainWindow(QMainWindow):
         self.preview_label.setPixmap(QPixmap())
 
         self.scan_thread = QThread(self)
-        self.scanner = FolderScanner()
-        self.scanner.moveToThread(self.scan_thread)
-        self.scanner.progress_changed.connect(self.on_scan_progress)
+        scanner = FolderScanner()
+        self.scanner = scanner
+        scanner.moveToThread(self.scan_thread)
+        scanner.progress_changed.connect(self.on_scan_progress)
 
+        paths_str = [str(p) for p in selected_paths]
         self.scan_thread.started.connect(
-            lambda: self.scanner.scan_folders([str(p) for p in selected_paths], recursive, scan_limit)
+            lambda scanner=scanner, paths=paths_str, recursive=recursive, scan_limit=scan_limit:
+                scanner.scan_folders(paths, recursive, scan_limit)
         )
-        self.scanner.scan_finished.connect(self.on_scan_finished)
-        self.scanner.scan_failed.connect(self.on_scan_failed)
-        self.scanner.scan_finished.connect(self.scan_thread.quit)
-        self.scanner.scan_failed.connect(self.scan_thread.quit)
+
+        scanner.scan_finished.connect(self.on_scan_finished)
+        scanner.scan_failed.connect(self.on_scan_failed)
+        scanner.scan_finished.connect(self.scan_thread.quit)
+        scanner.scan_failed.connect(self.scan_thread.quit)
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
 
         self.scan_thread.start()
@@ -481,19 +575,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Update", "Please check at least one field to update.")
             return
 
-        plan_lines = []
-        for source_path in selected_paths:
-            actions = []
-            if do_metadata:
-                actions.append("metadata")
-            if do_filename:
-                actions.append("filename")
-            if do_folder:
-                actions.append("folder")
-            if do_filesystem:
-                actions.append("filesystem")
-            plan_lines.append(f"{source_path.name} -> {year:04d}-{month:02d} [{', '.join(actions)}]")
-
         if self.preview_changes_check.isChecked():
             plan = self.build_update_plan(
                 selected_paths, year, month, do_metadata, do_filename, do_folder, do_filesystem
@@ -511,14 +592,22 @@ class MainWindow(QMainWindow):
                 if do_filename:
                     new_name = self.build_updated_filename(current_path.name, target_dt)
                     if new_name != current_path.name:
-                        dest_path, _ = resolve_destination_path(current_path.parent, new_name, current_path.stat().st_size)
+                        dest_path, _ = resolve_destination_path(
+                            current_path.parent,
+                            new_name,
+                            current_path.stat().st_size,
+                        )
                         if dest_path is not None and dest_path != current_path:
                             current_path = current_path.rename(dest_path)
 
                 if do_folder and self.current_folder is not None:
                     target_folder = self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}"
                     target_folder.mkdir(parents=True, exist_ok=True)
-                    dest_path, _ = resolve_destination_path(target_folder, current_path.name, current_path.stat().st_size)
+                    dest_path, _ = resolve_destination_path(
+                        target_folder,
+                        current_path.name,
+                        current_path.stat().st_size,
+                    )
                     if dest_path is not None and dest_path != current_path:
                         current_path = Path(shutil.move(str(current_path), str(dest_path)))
 
