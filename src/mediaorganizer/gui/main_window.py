@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,15 @@ from ..naming import resolve_destination_path
 class MainWindow(QMainWindow):
     DEFAULT_PRIORITY = ["metadata", "filename", "folder", "filesystem", "user_defined"]
 
+    VIDEO_EXTENSIONS = {
+        ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm",
+        ".mpg", ".mpeg"
+    }
+
+    IMAGE_EXTENSIONS = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Media Organizer UI")
@@ -55,6 +65,7 @@ class MainWindow(QMainWindow):
         self.scan_thread: Optional[QThread] = None
         self.scanner: Optional[FolderScanner] = None
         self.current_info_path: Optional[Path] = None
+        self.thumbnail_cache: dict[Path, Optional[Path]] = {}
 
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath("")
@@ -128,7 +139,6 @@ class MainWindow(QMainWindow):
         self.details_group = QGroupBox("Selected File Details")
         details_layout = QVBoxLayout(self.details_group)
 
-        # Sol üst: update checkbox paneli
         update_group = QGroupBox("Update Targets")
         update_layout = QFormLayout(update_group)
         update_layout.addRow(self.metadata_check, self.metadata_value_label)
@@ -136,7 +146,6 @@ class MainWindow(QMainWindow):
         update_layout.addRow(self.folder_check, self.folder_value_label)
         update_layout.addRow(self.filesystem_check, self.filesystem_value_label)
 
-        # Sağ üst: priority paneli
         priority_group = QGroupBox("Date Source Priority")
 
         priority_buttons_layout = QVBoxLayout()
@@ -150,12 +159,10 @@ class MainWindow(QMainWindow):
 
         priority_group.setLayout(priority_inner_layout)
 
-        # Üst kısım: iki panel yan yana
         top_panels_layout = QHBoxLayout()
         top_panels_layout.addWidget(update_group, 1)
         top_panels_layout.addWidget(priority_group, 1)
 
-        # Alt kısım: tarih, preview, bilgi ve update
         bottom_form = QFormLayout()
         bottom_form.addRow("Year", self.year_combo)
         bottom_form.addRow("Month", self.month_combo)
@@ -374,6 +381,7 @@ class MainWindow(QMainWindow):
 
     def set_folder(self, folder: Path) -> None:
         self.current_folder = folder
+        self.thumbnail_cache.clear()
         self.current_folder_label.setText(str(folder))
         self.folder_list.set_folder_entries(folder)
         if self.folder_list.rowCount() > 0:
@@ -398,7 +406,8 @@ class MainWindow(QMainWindow):
         count = 0
         exts = {
             ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".gif",
-            ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm"
+            ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm",
+            ".mpg", ".mpeg"
         }
 
         for folder in selected_paths:
@@ -555,20 +564,105 @@ class MainWindow(QMainWindow):
         self.show_preview(first_path)
         self.populate_details_panel(first_path)
 
+    def extract_video_thumbnail(self, path: Path) -> Optional[Path]:
+        cached = self.thumbnail_cache.get(path)
+        if cached is not None and cached.exists():
+            return cached
+
+        thumb = self._extract_video_thumbnail_with_exiftool(path)
+        if thumb is None:
+            thumb = self._extract_video_frame_with_ffmpeg(path)
+
+        self.thumbnail_cache[path] = thumb
+        return thumb
+
+    def _extract_video_thumbnail_with_exiftool(self, path: Path) -> Optional[Path]:
+        try:
+            safe_name = f"media_thumb_{abs(hash(str(path)))}.jpg"
+            thumb_path = Path(tempfile.gettempdir()) / safe_name
+
+            cmd = [
+                "exiftool",
+                "-b",
+                "-ThumbnailImage",
+                str(path),
+            ]
+
+            with open(thumb_path, "wb") as f:
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+
+            if result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
+                return thumb_path
+        except Exception:
+            pass
+
+        return None
+
+    def _extract_video_frame_with_ffmpeg(self, path: Path) -> Optional[Path]:
+        try:
+            safe_name = f"media_frame_{abs(hash(str(path)))}.jpg"
+            thumb_path = Path(tempfile.gettempdir()) / safe_name
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                "00:00:01",
+                "-i",
+                str(path),
+                "-vframes",
+                "1",
+                str(thumb_path),
+            ]
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
+                return thumb_path
+        except Exception:
+            pass
+
+        return None
+
     def show_preview(self, path: Path) -> None:
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}:
+        ext = path.suffix.lower()
+
+        if ext in self.IMAGE_EXTENSIONS:
             pixmap = QPixmap(str(path))
             if pixmap.isNull():
                 self.preview_label.setText("Image preview not available")
                 self.preview_label.setPixmap(QPixmap())
                 return
+
             self.preview_label.setPixmap(
                 pixmap.scaled(500, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
             self.preview_label.setText("")
-        else:
+            return
+
+        if ext in self.VIDEO_EXTENSIONS:
+            thumb_path = self.extract_video_thumbnail(path)
+
+            if thumb_path is not None:
+                pixmap = QPixmap(str(thumb_path))
+                if not pixmap.isNull():
+                    self.preview_label.setPixmap(
+                        pixmap.scaled(500, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    )
+                    self.preview_label.setText("")
+                    return
+
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("Preview is currently available only for image files.")
+            self.preview_label.setText("Video preview not available")
+            return
+
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("Preview is currently available only for image and video files.")
 
     def populate_details_panel(self, path: Path) -> None:
         dates = self.get_dates_for_path(path)
@@ -687,7 +781,7 @@ class MainWindow(QMainWindow):
             try:
                 current_path = source_path
                 dates = self.get_dates_for_path(source_path)
-                target_dt, source_key = self.choose_date_by_priority(dates)
+                target_dt, _source_key = self.choose_date_by_priority(dates)
 
                 if target_dt is None:
                     errors.append(f"{source_path.name}: no usable date found")

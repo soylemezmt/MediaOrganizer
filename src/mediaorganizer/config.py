@@ -4,7 +4,7 @@
 
 SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".gif",
-    ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm"
+    ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm",".mpg", ".mpeg"
 }
 
 # Tarih öncelik sırası: değiştirebilirsiniz
