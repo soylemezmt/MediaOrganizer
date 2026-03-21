@@ -45,7 +45,7 @@ from ..naming import resolve_destination_path
 
 
 class MainWindow(QMainWindow):
-    DEFAULT_PRIORITY = ["metadata", "filename", "folder", "filesystem", "user_defined"]
+    DEFAULT_PRIORITY = ["filename", "folder", "metadata", "filesystem", "user_defined"]
 
     VIDEO_EXTENSIONS = {
         ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm",
@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self.scan_thread: Optional[QThread] = None
         self.scanner: Optional[FolderScanner] = None
         self.current_info_path: Optional[Path] = None
+        self.current_preview_video_path: Optional[Path] = None
         self.thumbnail_cache: dict[Path, Optional[Path]] = {}
 
         self.file_model = QFileSystemModel()
@@ -98,6 +99,24 @@ class MainWindow(QMainWindow):
         self.preview_label.setMinimumSize(500, 420)
         self.preview_label.setStyleSheet("border: 1px solid #999; background: #fafafa;")
 
+        self.play_overlay_button = QPushButton("▶", self.preview_label)
+        self.play_overlay_button.setFixedSize(72, 72)
+        self.play_overlay_button.hide()
+        self.play_overlay_button.clicked.connect(self.open_current_video)
+        self.play_overlay_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 140);
+                color: white;
+                border: 2px solid white;
+                border-radius: 36px;
+                font-size: 30px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 180);
+            }
+        """)
+
         self.metadata_value_label = QLabel("")
         self.filename_value_label = QLabel("")
         self.folder_value_label = QLabel("")
@@ -107,14 +126,17 @@ class MainWindow(QMainWindow):
         self.filename_check = QCheckBox("Update Filename")
         self.folder_check = QCheckBox("Update Folder")
         self.filesystem_check = QCheckBox("Update Filesystem")
+        self.filesystem_check.setChecked(True)
 
         self.year_combo = QComboBox()
         for year in range(1990, 2101):
             self.year_combo.addItem(str(year))
+        self.year_combo.setFixedWidth(90)
 
         self.month_combo = QComboBox()
         for month in range(1, 13):
             self.month_combo.addItem(f"{month:02d}")
+        self.month_combo.setFixedWidth(90)
 
         self.preview_changes_check = QCheckBox("Preview changes before update")
         self.preview_changes_check.setChecked(True)
@@ -382,6 +404,9 @@ class MainWindow(QMainWindow):
     def set_folder(self, folder: Path) -> None:
         self.current_folder = folder
         self.thumbnail_cache.clear()
+        self.current_preview_video_path = None
+        self.show_play_overlay(False)
+
         self.current_folder_label.setText(str(folder))
         self.folder_list.set_folder_entries(folder)
         if self.folder_list.rowCount() > 0:
@@ -394,13 +419,18 @@ class MainWindow(QMainWindow):
 
     def clear_details_panel(self) -> None:
         self.current_info_path = None
+        self.current_preview_video_path = None
+        self.show_play_overlay(False)
+
         self.metadata_value_label.setText("")
         self.filename_value_label.setText("")
         self.folder_value_label.setText("")
         self.filesystem_value_label.setText("")
         self.selection_count_label.setText("You have not selected a file")
-        for cb in [self.metadata_check, self.filename_check, self.folder_check, self.filesystem_check]:
-            cb.setChecked(False)
+        self.metadata_check.setChecked(False)
+        self.filename_check.setChecked(False)
+        self.folder_check.setChecked(False)
+        self.filesystem_check.setChecked(True)
 
     def estimate_selected_file_count(self, selected_paths: list[Path], recursive: bool) -> int:
         count = 0
@@ -488,6 +518,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Scanning: {folder_text} ...")
         self.preview_label.setText("Scanning...")
         self.preview_label.setPixmap(QPixmap())
+        self.show_play_overlay(False)
+        self.current_preview_video_path = None
 
         self.scan_thread = QThread(self)
         scanner = FolderScanner()
@@ -529,6 +561,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded {len(rows)} media files.")
         self.preview_label.setText("Preview")
         self.preview_label.setPixmap(QPixmap())
+        self.show_play_overlay(False)
+        self.current_preview_video_path = None
         self.clear_details_panel()
         if len(rows) > 0:
             self.media_table.selectRow(0)
@@ -537,6 +571,9 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
         self.statusBar().showMessage("Scan failed")
         self.preview_label.setText("Preview")
+        self.preview_label.setPixmap(QPixmap())
+        self.show_play_overlay(False)
+        self.current_preview_video_path = None
         self.clear_details_panel()
 
     def selected_file_paths(self) -> list[Path]:
@@ -556,6 +593,8 @@ class MainWindow(QMainWindow):
         count = len(selected_paths)
         if count == 0:
             self.clear_details_panel()
+            self.preview_label.setText("Preview")
+            self.preview_label.setPixmap(QPixmap())
             return
 
         self.selection_count_label.setText(f"{count} files are selected.")
@@ -563,6 +602,34 @@ class MainWindow(QMainWindow):
         self.current_info_path = first_path
         self.show_preview(first_path)
         self.populate_details_panel(first_path)
+
+    def position_play_overlay(self) -> None:
+        btn = self.play_overlay_button
+        parent = self.preview_label
+        x = (parent.width() - btn.width()) // 2
+        y = (parent.height() - btn.height()) // 2
+        btn.move(max(0, x), max(0, y))
+
+    def show_play_overlay(self, visible: bool) -> None:
+        if visible:
+            self.position_play_overlay()
+            self.play_overlay_button.show()
+            self.play_overlay_button.raise_()
+        else:
+            self.play_overlay_button.hide()
+
+    def open_current_video(self) -> None:
+        if self.current_preview_video_path is None:
+            return
+
+        if not self.current_preview_video_path.exists():
+            QMessageBox.warning(self, "Video", "Video file not found.")
+            return
+
+        try:
+            os.startfile(str(self.current_preview_video_path))
+        except Exception as exc:
+            QMessageBox.warning(self, "Video", f"Could not open video: {exc}")
 
     def extract_video_thumbnail(self, path: Path) -> Optional[Path]:
         cached = self.thumbnail_cache.get(path)
@@ -631,6 +698,8 @@ class MainWindow(QMainWindow):
 
     def show_preview(self, path: Path) -> None:
         ext = path.suffix.lower()
+        self.current_preview_video_path = None
+        self.show_play_overlay(False)
 
         if ext in self.IMAGE_EXTENSIONS:
             pixmap = QPixmap(str(path))
@@ -655,10 +724,14 @@ class MainWindow(QMainWindow):
                         pixmap.scaled(500, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     )
                     self.preview_label.setText("")
+                    self.current_preview_video_path = path
+                    self.show_play_overlay(True)
                     return
 
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Video preview not available")
+            self.current_preview_video_path = path
+            self.show_play_overlay(True)
             return
 
         self.preview_label.setPixmap(QPixmap())
@@ -909,6 +982,10 @@ class MainWindow(QMainWindow):
             ctypes.windll.kernel32.CloseHandle(handle)
             if not ok:
                 raise RuntimeError("SetFileTime failed while updating creation time")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.position_play_overlay()
 
     def closeEvent(self, event) -> None:
         self._cleanup_scan_thread()
