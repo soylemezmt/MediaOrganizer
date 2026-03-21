@@ -27,7 +27,7 @@ class MediaTableModel(QAbstractTableModel):
         "Folder",
         "Filesystem",
         "Size",
-        "Full Path",
+        "Path",
     ]
 
     def __init__(self) -> None:
