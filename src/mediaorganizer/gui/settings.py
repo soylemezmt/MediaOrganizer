@@ -9,6 +9,7 @@ class ColumnSettings:
     show_filesystem: bool = True
     show_size: bool = True
     show_path: bool = True
+    show_full_path: bool = False
     show_country: bool = False
     show_city: bool = False
 

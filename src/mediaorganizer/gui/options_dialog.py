@@ -33,6 +33,7 @@ class OptionsDialog(QDialog):
         self.chk_filesystem = QCheckBox()
         self.chk_size = QCheckBox()
         self.chk_path = QCheckBox()
+        self.chk_full_path = QCheckBox()
         self.chk_country = QCheckBox()
         self.chk_city = QCheckBox()
 
@@ -44,6 +45,7 @@ class OptionsDialog(QDialog):
         self.chk_filesystem.setChecked(c.show_filesystem)
         self.chk_size.setChecked(c.show_size)
         self.chk_path.setChecked(c.show_path)
+        self.chk_full_path.setChecked(c.show_full_path)
         self.chk_country.setChecked(c.show_country)
         self.chk_city.setChecked(c.show_city)
 
@@ -55,6 +57,7 @@ class OptionsDialog(QDialog):
         columns_layout.addRow("Filesystem", self.chk_filesystem)
         columns_layout.addRow("Size", self.chk_size)
         columns_layout.addRow("Path", self.chk_path)
+        columns_layout.addRow("Full Path", self.chk_full_path)
         columns_layout.addRow("Country/Longitude", self.chk_country)
         columns_layout.addRow("City/Latitude", self.chk_city)
 
@@ -103,6 +106,7 @@ class OptionsDialog(QDialog):
                 show_filesystem=self.chk_filesystem.isChecked(),
                 show_size=self.chk_size.isChecked(),
                 show_path=self.chk_path.isChecked(),
+                show_full_path=self.chk_full_path.isChecked(),
                 show_country=self.chk_country.isChecked(),
                 show_city=self.chk_city.isChecked(),
             ),

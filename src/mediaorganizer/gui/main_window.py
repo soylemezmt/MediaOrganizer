@@ -46,7 +46,10 @@ from .scanner import FolderScanner
 from .updatePreview import UpdatePreviewDialog
 from .utils import fmt_year_month
 from ..consistency import analyze_date_consistency, get_all_date_sources
-from ..metadata_reader import read_metadata_dates_with_exiftool
+from ..metadata_reader import (
+    read_metadata_dates_with_exiftool,
+    read_location_fields_with_exiftool,
+)
 from ..naming import resolve_destination_path
 from .options_dialog import OptionsDialog, UiOptions
 
@@ -132,6 +135,52 @@ class MainWindow(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(500, 420)
         self.preview_label.setStyleSheet("border: 1px solid #999; background: #fafafa;")
+        
+        self.info_panel_visible = False
+
+        self.info_group = QGroupBox("File Information")
+        self.info_group.setMinimumWidth(320)
+
+        info_form = QFormLayout(self.info_group)
+
+        self.info_name_label = QLabel("")
+        self.info_name_label.setWordWrap(True)
+
+        self.info_full_path_label = QLabel("")
+        self.info_full_path_label.setWordWrap(True)
+
+        self.info_size_label = QLabel("")
+        self.info_type_label = QLabel("")
+
+        self.info_metadata_date_label = QLabel("")
+        self.info_filename_date_label = QLabel("")
+        self.info_folder_date_label = QLabel("")
+        self.info_filesystem_date_label = QLabel("")
+
+        self.info_country_label = QLabel("")
+        self.info_city_label = QLabel("")
+        self.info_latitude_label = QLabel("")
+        self.info_longitude_label = QLabel("")
+
+        self.info_created_label = QLabel("")
+        self.info_modified_label = QLabel("")
+        self.info_accessed_label = QLabel("")
+
+        info_form.addRow("Name", self.info_name_label)
+        info_form.addRow("Full path", self.info_full_path_label)
+        info_form.addRow("Type", self.info_type_label)
+        info_form.addRow("Size", self.info_size_label)
+        info_form.addRow("Metadata date", self.info_metadata_date_label)
+        info_form.addRow("Filename date", self.info_filename_date_label)
+        info_form.addRow("Folder date", self.info_folder_date_label)
+        info_form.addRow("Filesystem date", self.info_filesystem_date_label)
+        info_form.addRow("Country", self.info_country_label)
+        info_form.addRow("City", self.info_city_label)
+        info_form.addRow("Latitude", self.info_latitude_label)
+        info_form.addRow("Longitude", self.info_longitude_label)
+        info_form.addRow("Created", self.info_created_label)
+        info_form.addRow("Modified", self.info_modified_label)
+        info_form.addRow("Accessed", self.info_accessed_label)
 
         self.play_overlay_button = QPushButton("▶", self.preview_label)
         self.play_overlay_button.setFixedSize(72, 72)
@@ -274,9 +323,22 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(self.media_table, 3)
 
+        preview_container = QWidget()
+        preview_container_layout = QVBoxLayout(preview_container)
+        preview_container_layout.setContentsMargins(0, 0, 0, 0)
+        preview_container_layout.addWidget(self.preview_label)
+
+        self.preview_info_splitter = QSplitter(Qt.Horizontal)
+        self.preview_info_splitter.addWidget(preview_container)
+        self.preview_info_splitter.addWidget(self.info_group)
+        self.preview_info_splitter.setStretchFactor(0, 4)
+        self.preview_info_splitter.setStretchFactor(1, 2)
+        
+        self.info_group.hide()
+
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        right_layout.addWidget(self.preview_label, 3)
+        right_layout.addWidget(self.preview_info_splitter, 3)
         right_layout.addWidget(self.details_group, 2)
 
         central_widget = QWidget()
@@ -332,6 +394,19 @@ class MainWindow(QMainWindow):
         display_options_action = QAction("Display and Date Options...", self)
         display_options_action.triggered.connect(self.show_options_dialog)
         options_menu.addAction(display_options_action)
+        
+        view_menu = menu_bar.addMenu("View")
+
+        self.toggle_info_panel_action = QAction("Show Info Panel", self)
+        self.toggle_info_panel_action.setCheckable(True)
+        self.toggle_info_panel_action.setChecked(False)
+        self.toggle_info_panel_action.triggered.connect(self.toggle_info_panel)
+
+        view_menu.addAction(self.toggle_info_panel_action)
+
+    def get_location_for_path(self, path: Path) -> dict:
+        location_map = read_location_fields_with_exiftool([path])
+        return location_map.get(path, {})
 
     def _load_default_priority(self) -> None:
         self.priority_list.clear()
@@ -396,12 +471,59 @@ class MainWindow(QMainWindow):
             cols.append("size")
         if c.show_path:
             cols.append("path")
+        if c.show_full_path:
+            cols.append("full_path")
         if c.show_country:
             cols.append("country")
         if c.show_city:
             cols.append("city")
 
         self.media_table_model.set_visible_columns(cols)
+
+    def toggle_info_panel(self, checked: bool) -> None:
+        self.info_panel_visible = checked
+        self.info_group.setVisible(checked)
+
+        if checked:
+            self.preview_info_splitter.setSizes([700, 320])
+            if self.current_info_path is not None:
+                self.populate_info_panel(self.current_info_path)
+        else:
+            self.preview_info_splitter.setSizes([1000, 0])
+
+
+    def populate_info_panel(self, path: Path) -> None:
+        self.info_name_label.setText(path.name)
+        self.info_full_path_label.setText(str(path.resolve()))
+        self.info_type_label.setText(path.suffix.lower())
+
+        try:
+            size_bytes = path.stat().st_size
+            self.info_size_label.setText(f"{size_bytes:,} bytes")
+        except Exception:
+            self.info_size_label.setText("")
+
+        dates = self.get_dates_for_path(path)
+        self.info_metadata_date_label.setText(self._fmt_year_month(dates.get("metadata")))
+        self.info_filename_date_label.setText(self._fmt_year_month(dates.get("filename")))
+        self.info_folder_date_label.setText(self._fmt_year_month(dates.get("folder")))
+        self.info_filesystem_date_label.setText(self._fmt_year_month(dates.get("filesystem")))
+
+        try:
+            stat = path.stat()
+            self.info_created_label.setText(datetime.fromtimestamp(stat.st_ctime).strftime("%Y-%m-%d %H:%M:%S"))
+            self.info_modified_label.setText(datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
+            self.info_accessed_label.setText(datetime.fromtimestamp(stat.st_atime).strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            self.info_created_label.setText("")
+            self.info_modified_label.setText("")
+            self.info_accessed_label.setText("")
+
+        location = self.get_location_for_path(path)
+        self.info_country_label.setText(str(location.get("country") or ""))
+        self.info_city_label.setText(str(location.get("city") or ""))
+        self.info_latitude_label.setText(str(location.get("gps_lat") or ""))
+        self.info_longitude_label.setText(str(location.get("gps_lon") or ""))
 
     def show_options_dialog(self) -> None:
         dlg = OptionsDialog(self.ui_options, self)
@@ -559,6 +681,7 @@ class MainWindow(QMainWindow):
             filesystem_date=fmt_year_month(dates.get("filesystem")),
             size_bytes=path.stat().st_size,
             is_inconsistent=is_inconsistent,
+            full_path=str(path.resolve()),
         )
 
     def incremental_refresh_files(self, old_paths: list[Path], new_paths: list[Path]) -> None:
@@ -617,6 +740,22 @@ class MainWindow(QMainWindow):
         self.filename_check.setChecked(False)
         self.folder_check.setChecked(False)
         self.filesystem_check.setChecked(True)
+        
+        self.info_name_label.setText("")
+        self.info_full_path_label.setText("")
+        self.info_size_label.setText("")
+        self.info_type_label.setText("")
+        self.info_metadata_date_label.setText("")
+        self.info_filename_date_label.setText("")
+        self.info_folder_date_label.setText("")
+        self.info_filesystem_date_label.setText("")
+        self.info_country_label.setText("")
+        self.info_city_label.setText("")
+        self.info_latitude_label.setText("")
+        self.info_longitude_label.setText("")
+        self.info_created_label.setText("")
+        self.info_modified_label.setText("")
+        self.info_accessed_label.setText("")
 
     def estimate_selected_file_count(self, selected_paths: list[Path], recursive: bool) -> int:
         count = 0
@@ -760,6 +899,18 @@ class MainWindow(QMainWindow):
         self.clear_details_panel()
         if len(rows) > 0:
             self.media_table.selectRow(0)
+            first_rel_path = self.media_table_model.get_path(0)
+            if first_rel_path is not None:
+                if self.current_folder is not None and not first_rel_path.is_absolute():
+                    first_path = self.current_folder / first_rel_path
+                else:
+                    first_path = first_rel_path
+
+                self.current_info_path = first_path
+                self.show_preview(first_path)
+                self.populate_details_panel(first_path)
+                self.selection_count_label.setText("1 files are selected.")
+            self.on_media_selection_changed()
 
     def on_scan_failed(self, msg: str) -> None:
         QMessageBox.critical(self, "Error", msg)
@@ -797,6 +948,9 @@ class MainWindow(QMainWindow):
         self.show_preview(first_path)
         self.populate_details_panel(first_path)
 
+        if self.info_panel_visible:
+            self.populate_info_panel(first_path)
+
     def on_media_table_clicked(self, index) -> None:
         if not index.isValid() or index.column() != 0:
             return
@@ -824,6 +978,10 @@ class MainWindow(QMainWindow):
     def rename_folder(self, old_path: Path, new_name: str) -> None:
         new_name = new_name.strip()
         if not new_name:
+            self.folder_list.revert_row_text(old_path)
+            return
+        
+        if new_name == old_path.name:
             self.folder_list.revert_row_text(old_path)
             return
 
@@ -865,7 +1023,6 @@ class MainWindow(QMainWindow):
         new_name = new_name.strip()
 
         if not new_name or new_name == old_path.name:
-            self.refresh_selected_folders()
             return
 
         try:

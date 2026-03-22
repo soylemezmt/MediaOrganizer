@@ -94,6 +94,7 @@ class FolderScanner(QObject):
                             is_inconsistent=is_inconsistent,
                             country=country,
                             city=city,
+                            full_path=str(p.resolve()),
                         )
                     )
 

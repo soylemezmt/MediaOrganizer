@@ -19,6 +19,7 @@ class MediaRow:
     country: str = ""
     city: str = ""
     relative_dir: str = ""
+    full_path: str = ""
 
 
 class MediaTableModel(QAbstractTableModel):
@@ -31,6 +32,7 @@ class MediaTableModel(QAbstractTableModel):
         ("filesystem", "Filesystem"),
         ("size", "Size"),
         ("path", "Path"),
+        ("full_path", "Full Path"),
         ("country", "Country/Longitude"),
         ("city", "City/Latitude"),
     ]
@@ -89,6 +91,7 @@ class MediaTableModel(QAbstractTableModel):
                 "filesystem": row.filesystem_date,
                 "size": f"{row.size_bytes:,}",
                 "path": row.relative_dir,
+                "full_path": row.full_path,
                 "country": row.country,
                 "city": row.city,
             }
