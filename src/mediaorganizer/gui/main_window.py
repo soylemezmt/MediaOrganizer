@@ -53,6 +53,7 @@ from ..metadata_reader import (
 from ..naming import resolve_destination_path
 from .options_dialog import OptionsDialog, UiOptions
 from mediaorganizer.location_utils import infer_country_city_from_gps
+from .filter import MediaFilterProxyModel, HeaderFilterPopup, FilterHeaderView
 
 
 class FileNameEditDelegate(QStyledItemDelegate):
@@ -117,9 +118,18 @@ class MainWindow(QMainWindow):
         self.show_conflicts_only_checkbox.toggled.connect(self.apply_row_filters)
 
         self.media_table_model = MediaTableModel()
+
+        self.media_proxy_model = MediaFilterProxyModel(self)
+        self.media_proxy_model.setSourceModel(self.media_table_model)
+
         self.media_table = QTableView()
         self.media_table.setItemDelegateForColumn(0, FileNameEditDelegate(self, self.media_table))
-        self.media_table.setModel(self.media_table_model)
+        self.media_table.setModel(self.media_proxy_model)
+
+        self.filter_header = FilterHeaderView(Qt.Horizontal, self.media_table)
+        self.media_table.setHorizontalHeader(self.filter_header)
+        self.filter_header.filter_changed.connect(self.on_column_filter_changed)
+        
         self.media_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.media_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.media_table.setAlternatingRowColors(True)
@@ -482,18 +492,18 @@ class MainWindow(QMainWindow):
         self.preview_info_splitter.setSizes([1000, 0])
 
     def apply_row_filters(self) -> None:
-        rows = list(self.all_media_rows)
+        self.media_table_model.set_rows(list(self.all_media_rows))
+        self.media_proxy_model.set_show_conflicts_only(
+            self.show_conflicts_only_checkbox.isChecked()
+        )
 
-        if self.show_conflicts_only_checkbox.isChecked():
-            rows = [row for row in rows if row.is_inconsistent]
-
-        self.media_table_model.set_rows(rows)
-
-        if rows:
+        if self.media_proxy_model.rowCount() > 0:
             self.media_table.selectRow(0)
         else:
             self.preview_label.setText("Preview")
             self.preview_label.setPixmap(QPixmap())
+            self.show_play_overlay(False)
+            self.current_preview_video_path = None
             self.clear_details_panel()
 
     def apply_column_settings(self) -> None:
@@ -600,6 +610,32 @@ class MainWindow(QMainWindow):
         item = self.priority_list.takeItem(row)
         self.priority_list.insertItem(new_row, item)
         self.priority_list.setCurrentRow(new_row)
+
+    def on_column_filter_changed(self, section: int, text: str) -> None:
+        self.media_proxy_model.set_column_filter(section, text)
+        self.filter_header.set_filter_text(section, text)
+
+        if self.media_proxy_model.rowCount() > 0:
+            self.media_table.selectRow(0)
+        else:
+            self.preview_label.setText("Preview")
+            self.preview_label.setPixmap(QPixmap())
+            self.show_play_overlay(False)
+            self.current_preview_video_path = None
+            self.clear_details_panel()
+
+
+    def _source_row_from_proxy_index(self, index) -> int:
+        if not index.isValid():
+            return -1
+        source_index = self.media_proxy_model.mapToSource(index)
+        return source_index.row() if source_index.isValid() else -1
+
+
+    def _source_index_from_proxy_index(self, index):
+        if not index.isValid():
+            return index
+        return self.media_proxy_model.mapToSource(index)
 
     def on_target_folder_mode_changed(self, checked: bool) -> None:
         self.target_folder_edit.setEnabled(checked)
@@ -953,19 +989,25 @@ class MainWindow(QMainWindow):
         self.show_play_overlay(False)
         self.current_preview_video_path = None
         self.clear_details_panel()
-        if len(rows) > 0:
+        if self.media_proxy_model.rowCount() > 0:
             self.media_table.selectRow(0)
-            first_rel_path = self.media_table_model.get_path(0)
-            if first_rel_path is not None:
-                if self.current_folder is not None and not first_rel_path.is_absolute():
-                    first_path = self.current_folder / first_rel_path
-                else:
-                    first_path = first_rel_path
 
-                self.current_info_path = first_path
-                self.show_preview(first_path)
-                self.populate_details_panel(first_path)
-                self.selection_count_label.setText("1 files are selected.")
+            proxy_index = self.media_proxy_model.index(0, 0)
+            source_index = self.media_proxy_model.mapToSource(proxy_index)
+
+            if source_index.isValid():
+                first_rel_path = self.media_table_model.get_path(source_index.row())
+                if first_rel_path is not None:
+                    if self.current_folder is not None and not first_rel_path.is_absolute():
+                        first_path = self.current_folder / first_rel_path
+                    else:
+                        first_path = first_rel_path
+
+                    self.current_info_path = first_path
+                    self.show_preview(first_path)
+                    self.populate_details_panel(first_path)
+                    self.selection_count_label.setText("1 files are selected.")
+
             self.on_media_selection_changed()
 
     def on_scan_failed(self, msg: str) -> None:
@@ -980,13 +1022,19 @@ class MainWindow(QMainWindow):
     def selected_file_paths(self) -> list[Path]:
         rows = self.media_table.selectionModel().selectedRows()
         paths: list[Path] = []
-        for row in rows:
-            rel_path = self.media_table_model.get_path(row.row())
+
+        for proxy_index in rows:
+            source_index = self.media_proxy_model.mapToSource(proxy_index)
+            if not source_index.isValid():
+                continue
+
+            rel_path = self.media_table_model.get_path(source_index.row())
             if rel_path is not None:
                 if self.current_folder is not None and not rel_path.is_absolute():
                     paths.append(self.current_folder / rel_path)
                 else:
                     paths.append(rel_path)
+
         return paths
 
     def on_media_selection_changed(self) -> None:
@@ -1011,8 +1059,12 @@ class MainWindow(QMainWindow):
         if not index.isValid() or index.column() != 0:
             return
 
+        source_index = self.media_proxy_model.mapToSource(index)
+        if not source_index.isValid():
+            return
+
         modifiers = QApplication.keyboardModifiers()
-        row = index.row()
+        row = source_index.row()
         now = time.monotonic()
 
         if modifiers & (Qt.ControlModifier | Qt.ShiftModifier):
@@ -1024,7 +1076,7 @@ class MainWindow(QMainWindow):
         delta = now - self._last_media_click_ts
 
         if same_row and 0.4 <= delta <= 1.5:
-            if self.media_table.selectionModel().isRowSelected(row, self.media_table.rootIndex()):
+            if self.media_table.selectionModel().isRowSelected(index.row(), self.media_table.rootIndex()):
                 if self.media_table.state() != QAbstractItemView.EditingState:
                     self.media_table.edit(index)
 
@@ -1070,7 +1122,11 @@ class MainWindow(QMainWindow):
         if not index.isValid():
             return
 
-        row = index.row()
+        source_index = self.media_proxy_model.mapToSource(index)
+        if not source_index.isValid():
+            return
+
+        row = source_index.row()
         rel_path = self.media_table_model.get_path(row)
         if rel_path is None:
             return
@@ -1097,6 +1153,23 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Rename File", f"Could not rename file:\n{exc}")
             self.refresh_selected_folders()
+
+    def _map_proxy_row_to_source_row(self, proxy_row: int) -> int:
+        proxy_index = self.media_proxy_model.index(proxy_row, 0)
+        if not proxy_index.isValid():
+            return -1
+
+        source_index = self.media_proxy_model.mapToSource(proxy_index)
+        if not source_index.isValid():
+            return -1
+
+        return source_index.row()
+
+
+    def _map_proxy_index_to_source_index(self, proxy_index):
+        if not proxy_index.isValid():
+            return proxy_index
+        return self.media_proxy_model.mapToSource(proxy_index)
 
     def delete_selected_files(self) -> None:
         selected_paths = self.selected_file_paths()
@@ -1137,7 +1210,7 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("Preview")
             self.preview_label.setPixmap(QPixmap())
 
-            row_count = self.media_table_model.rowCount()
+            row_count = self.media_proxy_model.rowCount()
             if row_count > 0:
                 row_to_select = preferred_row if preferred_row < row_count else 0
                 self.media_table.selectRow(row_to_select)
