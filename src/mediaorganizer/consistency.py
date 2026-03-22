@@ -1,8 +1,11 @@
 import csv
 import os
+import sys
+import ctypes
+import ctypes.wintypes as wintypes
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple
 
 from .file_types import is_supported_media_file
@@ -22,13 +25,67 @@ def collect_files(source_dir: Path) -> List[Path]:
     return files
 
 
+def _read_windows_filetime(path: Path) -> Optional[datetime]:
+    class FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
+    class WIN32_FILE_ATTRIBUTE_DATA(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", FILETIME),
+            ("ftLastAccessTime", FILETIME),
+            ("ftLastWriteTime", FILETIME),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+        ]
+
+    GetFileAttributesExW = ctypes.windll.kernel32.GetFileAttributesExW
+    GetFileAttributesExW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.INT,
+        ctypes.POINTER(WIN32_FILE_ATTRIBUTE_DATA),
+    ]
+    GetFileAttributesExW.restype = wintypes.BOOL
+
+    data = WIN32_FILE_ATTRIBUTE_DATA()
+    ok = GetFileAttributesExW(str(path), 0, ctypes.byref(data))
+    if not ok:
+        return None
+
+    # Öncelik: creation time, olmazsa last write time
+    ft = data.ftCreationTime
+    filetime = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+    if filetime == 0:
+        ft = data.ftLastWriteTime
+        filetime = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+        if filetime == 0:
+            return None
+
+    us = filetime / 10  # 100ns -> microseconds
+    return datetime(1601, 1, 1) + timedelta(microseconds=us)
+
+
 def get_filesystem_date(path: Path) -> Optional[datetime]:
     try:
         stat = path.stat()
+
         try:
             return datetime.fromtimestamp(stat.st_ctime)
         except Exception:
+            pass
+
+        try:
             return datetime.fromtimestamp(stat.st_mtime)
+        except Exception:
+            pass
+
+        if sys.platform.startswith("win"):
+            return _read_windows_filetime(path)
+
+        return None
     except Exception:
         return None
 
@@ -93,22 +150,6 @@ def analyze_date_consistency(
     Dict[Tuple[int, ...], List[str]],
     str
 ]:
-    """
-    Döner:
-      (
-        is_inconsistent,
-        normalized_values,
-        non_empty_sources,
-        grouped_sources,
-        status
-      )
-
-    status:
-      - ALL_EMPTY
-      - ONLY_ONE_SOURCE
-      - OK
-      - INCONSISTENT
-    """
     normalized: Dict[str, Optional[Tuple[int, ...]]] = {}
     non_empty_sources: List[str] = []
     grouped_sources: Dict[Tuple[int, ...], List[str]] = {}

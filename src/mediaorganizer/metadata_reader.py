@@ -7,9 +7,6 @@ from typing import Optional, Dict, List
 from .date_parsing import parse_date_string
 from .config import EXIFTOOL_DATE_TAGS
 
-# ============================================================
-# EXIFTOOL SUPPORT
-# ============================================================
 
 def chunked(lst: List[Path], size: int):
     for i in range(0, len(lst), size):
@@ -20,17 +17,23 @@ def read_metadata_dates_with_exiftool(files: List[Path]) -> Dict[Path, Optional[
     """
     ExifTool ile toplu metadata okur.
     ExifTool PATH'te yoksa boş döner.
+    stderr uyarıları olsa bile stdout parse edilmeye çalışılır.
     """
     result: Dict[Path, Optional[datetime]] = {f: None for f in files}
 
     try:
-        subprocess.run(
+        probe = subprocess.run(
             ["exiftool", "-ver"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=True,
-            text=True
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
+        if probe.returncode != 0:
+            print("UYARI: exiftool bulunamadı. Metadata tarihi okunamayacak.")
+            return result
     except Exception:
         print("UYARI: exiftool bulunamadı. Metadata tarihi okunamayacak.")
         return result
@@ -55,9 +58,23 @@ def read_metadata_dates_with_exiftool(files: List[Path]) -> Dict[Path, Optional[
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=True
+                encoding="utf-8",
+                errors="replace",
+                check=False,
             )
-            data = json.loads(proc.stdout)
+
+            if proc.stderr.strip():
+                print(f"UYARI: exiftool stderr: {proc.stderr.strip()}")
+
+            if not proc.stdout.strip():
+                continue
+
+            try:
+                data = json.loads(proc.stdout)
+            except Exception as e:
+                print(f"UYARI: exiftool JSON parse hatası: {e}")
+                continue
+
         except Exception as e:
             print(f"UYARI: exiftool okuma hatası: {e}")
             continue

@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import os
-import time
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from send2trash import send2trash
-
-from PySide6.QtCore import Qt, QThread, QStandardPaths, QTimer
+from PySide6.QtCore import Qt, QThread, QStandardPaths
 from PySide6.QtGui import QAction, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -27,6 +25,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -38,6 +37,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from send2trash import send2trash
 
 from .folderListTable import FolderListTable
 from .models import MediaRow, MediaTableModel
@@ -82,7 +83,7 @@ class MainWindow(QMainWindow):
         self.current_info_path: Optional[Path] = None
         self.current_preview_video_path: Optional[Path] = None
         self.thumbnail_cache: dict[Path, Optional[Path]] = {}
-        
+
         self._last_media_clicked_row: Optional[int] = None
         self._last_media_click_ts: float = 0.0
 
@@ -114,7 +115,7 @@ class MainWindow(QMainWindow):
         self.media_table.horizontalHeader().setStretchLastSection(True)
         self.media_table.selectionModel().selectionChanged.connect(self.on_media_selection_changed)
         self.media_table.clicked.connect(self.on_media_table_clicked)
-        
+
         self.delete_shortcut = QShortcut(QKeySequence.Delete, self.media_table)
         self.delete_shortcut.setContext(Qt.WidgetShortcut)
         self.delete_shortcut.activated.connect(self.delete_selected_files)
@@ -163,12 +164,28 @@ class MainWindow(QMainWindow):
             self.month_combo.addItem(f"{month:02d}")
         self.month_combo.setFixedWidth(90)
 
+        pictures_path = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+        default_target_folder = pictures_path if pictures_path else str(Path.home())
+
+        self.target_folder_check = QCheckBox("Target folder")
+        self.target_folder_check.setChecked(False)
+        self.target_folder_check.toggled.connect(self.on_target_folder_mode_changed)
+
+        self.target_folder_edit = QLineEdit(default_target_folder)
+        self.target_folder_edit.setEnabled(False)
+
+        self.target_folder_button = QPushButton("...")
+        self.target_folder_button.setFixedWidth(36)
+        self.target_folder_button.setEnabled(False)
+        self.target_folder_button.clicked.connect(self.choose_target_folder)
+
         self.preview_changes_check = QCheckBox("Preview changes before update")
         self.preview_changes_check.setChecked(True)
 
         self.priority_list = QListWidget()
         self.priority_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.priority_list.setMinimumHeight(120)
+        self.priority_list.setMinimumWidth(130)
 
         self.priority_up_button = QPushButton("↑")
         self.priority_down_button = QPushButton("↓")
@@ -206,13 +223,26 @@ class MainWindow(QMainWindow):
 
         priority_group.setLayout(priority_inner_layout)
 
+        user_date_group = QGroupBox("User Defined Date")
+        user_date_group.setMinimumWidth(170)
+        user_date_layout = QFormLayout(user_date_group)
+        user_date_layout.addRow("Year", self.year_combo)
+        user_date_layout.addRow("Month", self.month_combo)
+
         top_panels_layout = QHBoxLayout()
         top_panels_layout.addWidget(update_group, 1)
         top_panels_layout.addWidget(priority_group, 1)
+        top_panels_layout.addWidget(user_date_group, 0)
 
         bottom_form = QFormLayout()
-        bottom_form.addRow("Year", self.year_combo)
-        bottom_form.addRow("Month", self.month_combo)
+
+        target_folder_widget = QWidget()
+        target_folder_layout = QHBoxLayout(target_folder_widget)
+        target_folder_layout.setContentsMargins(0, 0, 0, 0)
+        target_folder_layout.addWidget(self.target_folder_edit, 1)
+        target_folder_layout.addWidget(self.target_folder_button, 0)
+        bottom_form.addRow(self.target_folder_check, target_folder_widget)
+
         bottom_form.addRow(self.preview_changes_check)
         bottom_form.addRow(self.selection_count_label)
         bottom_form.addRow(self.update_button)
@@ -248,7 +278,6 @@ class MainWindow(QMainWindow):
         self._create_menu()
         self.statusBar().showMessage("Ready")
 
-        pictures_path = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
         if pictures_path:
             default_path = Path(pictures_path)
             if default_path.exists():
@@ -299,60 +328,6 @@ class MainWindow(QMainWindow):
         }
         return labels.get(key, key)
 
-    def delete_selected_files(self) -> None:
-        selected_paths = self.selected_file_paths()
-        if not selected_paths:
-            return
-
-        selected_rows = sorted(idx.row() for idx in self.media_table.selectionModel().selectedRows())
-        preferred_row = selected_rows[0] if selected_rows else 0
-
-        if len(selected_paths) > 1:
-            reply = QMessageBox.question(
-                self,
-                "Delete Files",
-                f"Send {len(selected_paths)} selected files to Recycle Bin?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        errors: list[str] = []
-        deleted_paths: list[Path] = []
-
-        for path in selected_paths:
-            try:
-                send2trash(str(path))
-                deleted_paths.append(path)
-            except Exception as exc:
-                errors.append(f"{path.name}: {exc}")
-
-        if deleted_paths:
-            if len(deleted_paths) <= 50:
-                self.incremental_refresh_files(deleted_paths, [])
-            else:
-                self.refresh_selected_folders()
-
-            self.clear_details_panel()
-            self.preview_label.setText("Preview")
-            self.preview_label.setPixmap(QPixmap())
-
-            row_count = self.media_table_model.rowCount()
-            if row_count > 0:
-                row_to_select = preferred_row if preferred_row < row_count else 0
-                self.media_table.selectRow(row_to_select)
-
-        if errors:
-            QMessageBox.warning(
-                self,
-                "Delete completed with errors",
-                "\n".join(errors[:20]),
-            )
-        elif deleted_paths:
-            self.statusBar().showMessage(f"{len(deleted_paths)} file(s) sent to Recycle Bin.")
-
-
     def move_priority_item(self, delta: int) -> None:
         row = self.priority_list.currentRow()
         if row < 0:
@@ -365,6 +340,56 @@ class MainWindow(QMainWindow):
         item = self.priority_list.takeItem(row)
         self.priority_list.insertItem(new_row, item)
         self.priority_list.setCurrentRow(new_row)
+
+    def on_target_folder_mode_changed(self, checked: bool) -> None:
+        self.target_folder_edit.setEnabled(checked)
+        self.target_folder_button.setEnabled(checked)
+        self.update_button.setText("Copy" if checked else "Update")
+
+    def choose_target_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Target Folder",
+            self.target_folder_edit.text().strip() or str(Path.home()),
+        )
+        if folder:
+            self.target_folder_edit.setText(folder)
+
+    def get_target_folder_path(self) -> Path:
+        text = self.target_folder_edit.text().strip()
+        if text:
+            return Path(text)
+        pictures_path = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+        return Path(pictures_path) if pictures_path else Path.home()
+
+    def get_relative_parent_under_current_folder(self, source_path: Path) -> Path:
+        if self.current_folder is not None:
+            try:
+                rel_parent = source_path.parent.relative_to(self.current_folder)
+                return rel_parent
+            except Exception:
+                pass
+        return Path(".")
+
+    def get_copy_target_dir(self, source_path: Path, target_dt: datetime, do_folder: bool, target_root: Path) -> Path:
+        if do_folder:
+            return target_root / f"{target_dt.year:04d}" / f"{target_dt.month:02d}"
+        rel_parent = self.get_relative_parent_under_current_folder(source_path)
+        return target_root / rel_parent
+
+    def get_copy_preview_path(
+        self,
+        source_path: Path,
+        target_dt: datetime,
+        do_filename: bool,
+        do_folder: bool,
+        target_root: Path,
+    ) -> Path:
+        dest_dir = self.get_copy_target_dir(source_path, target_dt, do_folder, target_root)
+        dest_name = source_path.name
+        if do_filename:
+            dest_name = self.build_updated_filename(dest_name, target_dt)
+        return dest_dir / dest_name
 
     def get_priority_order(self) -> list[str]:
         order: list[str] = []
@@ -705,7 +730,6 @@ class MainWindow(QMainWindow):
 
         self._last_media_clicked_row = row
         self._last_media_click_ts = now
-        
 
     def rename_folder(self, old_path: Path, new_name: str) -> None:
         new_name = new_name.strip()
@@ -770,6 +794,59 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Rename File", f"Could not rename file:\n{exc}")
             self.refresh_selected_folders()
+
+    def delete_selected_files(self) -> None:
+        selected_paths = self.selected_file_paths()
+        if not selected_paths:
+            return
+
+        selected_rows = sorted(idx.row() for idx in self.media_table.selectionModel().selectedRows())
+        preferred_row = selected_rows[0] if selected_rows else 0
+
+        if len(selected_paths) > 1:
+            reply = QMessageBox.question(
+                self,
+                "Delete Files",
+                f"Send {len(selected_paths)} selected files to Recycle Bin?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        errors: list[str] = []
+        deleted_paths: list[Path] = []
+
+        for path in selected_paths:
+            try:
+                send2trash(str(path))
+                deleted_paths.append(path)
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+
+        if deleted_paths:
+            if len(deleted_paths) <= 50:
+                self.incremental_refresh_files(deleted_paths, [])
+            else:
+                self.refresh_selected_folders()
+
+            self.clear_details_panel()
+            self.preview_label.setText("Preview")
+            self.preview_label.setPixmap(QPixmap())
+
+            row_count = self.media_table_model.rowCount()
+            if row_count > 0:
+                row_to_select = preferred_row if preferred_row < row_count else 0
+                self.media_table.selectRow(row_to_select)
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete completed with errors",
+                "\n".join(errors[:20]),
+            )
+        elif deleted_paths:
+            self.statusBar().showMessage(f"{len(deleted_paths)} file(s) sent to Recycle Bin.")
 
     def position_play_overlay(self) -> None:
         btn = self.play_overlay_button
@@ -936,6 +1013,8 @@ class MainWindow(QMainWindow):
         do_filesystem: bool,
     ) -> list[dict]:
         plan = []
+        copy_mode = self.target_folder_check.isChecked()
+        target_root = self.get_target_folder_path() if copy_mode else None
 
         for source_path in selected_paths:
             old_dates = self.get_dates_for_path(source_path)
@@ -952,13 +1031,26 @@ class MainWindow(QMainWindow):
                 f"user_defined={self._fmt_year_month(self.get_user_defined_date())}"
             )
 
-            new_name = source_path.name
-            if do_filename:
-                new_name = self.build_updated_filename(source_path.name, target_dt)
+            if copy_mode and target_root is not None:
+                preview_dest = self.get_copy_preview_path(
+                    source_path,
+                    target_dt,
+                    do_filename,
+                    do_folder,
+                    target_root,
+                )
+                new_name = preview_dest.name
+                new_folder = str(preview_dest.parent)
+                action_label = "copy"
+            else:
+                new_name = source_path.name
+                if do_filename:
+                    new_name = self.build_updated_filename(source_path.name, target_dt)
 
-            new_folder = str(source_path.parent)
-            if do_folder and self.current_folder is not None:
-                new_folder = str(self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}")
+                new_folder = str(source_path.parent)
+                if do_folder and self.current_folder is not None:
+                    new_folder = str(self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}")
+                action_label = "update"
 
             fields = []
             if do_metadata:
@@ -971,6 +1063,7 @@ class MainWindow(QMainWindow):
                 fields.append("filesystem")
 
             new_value = (
+                f"action={action_label}, "
                 f"date={target_dt.year:04d}-{target_dt.month:02d}, "
                 f"source={self._priority_label(source_key)}, "
                 f"name={new_name}, folder={new_folder}"
@@ -987,10 +1080,96 @@ class MainWindow(QMainWindow):
 
         return plan
 
+    def copy_selected_files(self) -> None:
+        selected_paths = self.selected_file_paths()
+        if not selected_paths:
+            QMessageBox.information(self, "Copy", "You have not selected a file")
+            return
+
+        target_root = self.get_target_folder_path()
+
+        do_metadata = self.metadata_check.isChecked()
+        do_filename = self.filename_check.isChecked()
+        do_folder = self.folder_check.isChecked()
+        do_filesystem = self.filesystem_check.isChecked()
+
+        if not target_root.exists():
+            try:
+                target_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "Copy", f"Could not create target folder:\n{exc}")
+                return
+
+        if self.preview_changes_check.isChecked():
+            plan = self.build_update_plan(
+                selected_paths,
+                int(self.year_combo.currentText()),
+                int(self.month_combo.currentText()),
+                do_metadata,
+                do_filename,
+                do_folder,
+                do_filesystem,
+            )
+            dialog = UpdatePreviewDialog(plan, self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+
+        errors: list[str] = []
+        copied_count = 0
+
+        for source_path in selected_paths:
+            try:
+                dates = self.get_dates_for_path(source_path)
+                target_dt, _source_key = self.choose_date_by_priority(dates)
+
+                if target_dt is None:
+                    errors.append(f"{source_path.name}: no usable date found")
+                    continue
+
+                dest_dir = self.get_copy_target_dir(source_path, target_dt, do_folder, target_root)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                dest_name = source_path.name
+                if do_filename:
+                    dest_name = self.build_updated_filename(dest_name, target_dt)
+
+                dest_path, _ = resolve_destination_path(
+                    dest_dir,
+                    dest_name,
+                    source_path.stat().st_size,
+                )
+
+                if dest_path is None:
+                    dest_path = dest_dir / dest_name
+
+                shutil.copy2(str(source_path), str(dest_path))
+
+                if do_metadata:
+                    self.write_metadata(dest_path, target_dt)
+
+                if do_filesystem:
+                    self.write_filesystem_time(dest_path, target_dt)
+
+                copied_count += 1
+
+            except Exception as exc:
+                errors.append(f"{source_path.name}: {exc}")
+
+        if errors:
+            QMessageBox.warning(self, "Copy completed with errors", "\n".join(errors[:20]))
+        else:
+            QMessageBox.information(self, "Copy", f"{copied_count} file(s) copied successfully.")
+
+        self.statusBar().showMessage(f"{copied_count} file(s) copied to {target_root}")
+
     def update_selected_files(self) -> None:
         selected_paths = self.selected_file_paths()
         if not selected_paths:
             QMessageBox.information(self, "Update", "You have not selected a file")
+            return
+
+        if self.target_folder_check.isChecked():
+            self.copy_selected_files()
             return
 
         year = int(self.year_combo.currentText())
@@ -1077,43 +1256,103 @@ class MainWindow(QMainWindow):
         p = Path(original_name)
         stem = p.stem
         ext = p.suffix
+
         y = f"{target_dt.year:04d}"
         m = f"{target_dt.month:02d}"
-        d = "01"
+        d = f"{target_dt.day:02d}"
+
+        year_re = r"(1[89]\d{2}|20\d{2})"
+
+        # ❗ ÖNEMLİ: sadece yıl içeren isimleri değiştirme
+        if re.match(rf"^{year_re}_", stem):
+            return original_name
+
+        if re.match(r"^((?:1[89]\d|20\d))x_", stem):
+            return original_name
 
         patterns = [
-            (r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", f"{y}{m}{d}"),
-            (r"(?<!\d)(20\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)", f"{y}-{m}-{d}"),
-            (r"(?<!\d)(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})(?!\d)", f"{y}-{m}-{d}"),
-            (r"(?<!\d)(20\d{2})[-_.](\d{2})(?!\d)", f"{y}-{m}"),
+            # YYYY_MM_DD
+            (rf"(?<!\d){year_re}_(\d{{2}})_(\d{{2}})(?!\d)", f"{y}_{m}_{d}"),
+
+            # YYYY_MM_
+            (rf"(?<!\d){year_re}_(\d{{2}})_(?!\d)", f"{y}_{m}_"),
+
+            # YYYYMMDD
+            (rf"(?<!\d){year_re}(\d{{2}})(\d{{2}})(?!\d)", f"{y}{m}{d}"),
+
+            # YYYY-MM-DD / YYYY.MM.DD / YYYY_MM_DD
+            (rf"(?<!\d){year_re}[-_.](\d{{2}})[-_.](\d{{2}})(?!\d)", f"{y}-{m}-{d}"),
+
+            # YYYY-M-D
+            (rf"(?<!\d){year_re}[-_.](\d{{1,2}})[-_.](\d{{1,2}})(?!\d)", f"{y}-{m}-{d}"),
+
+            # YYYY-MM
+            (rf"(?<!\d){year_re}[-_.](\d{{2}})(?!\d)", f"{y}-{m}"),
         ]
 
         for pattern, replacement in patterns:
             new_stem, count = re.subn(pattern, replacement, stem, count=1)
             if count > 0:
                 return new_stem + ext
+
         return original_name
+
+    def _is_image_file(self, path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".gif", ".webp"
+        }
+
+    def _is_video_file(self, path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm", ".mpg", ".mpeg"
+        }
 
     def write_metadata(self, path: Path, dt: datetime) -> None:
         dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
-        cmd = [
-            "exiftool",
-            "-overwrite_original",
-            f"-DateTimeOriginal={dt_str}",
-            f"-CreateDate={dt_str}",
-            f"-ModifyDate={dt_str}",
-            f"-MediaCreateDate={dt_str}",
-            f"-TrackCreateDate={dt_str}",
-            str(path),
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        cmd = ["exiftool", "-overwrite_original"]
+
+
+        if self._is_image_file(path):
+            cmd += [
+                f"-DateTimeOriginal={dt_str}",
+                f"-CreateDate={dt_str}",
+                f"-ModifyDate={dt_str}",
+            ]
+        elif self._is_video_file(path):
+            cmd += [
+                f"-CreateDate={dt_str}",
+                f"-ModifyDate={dt_str}",
+                f"-MediaCreateDate={dt_str}",
+                f"-TrackCreateDate={dt_str}",
+            ]
+        else:
+            cmd += [
+                f"-CreateDate={dt_str}",
+                f"-ModifyDate={dt_str}",
+            ]
+
+        cmd.append(str(path))
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        stderr_text = (result.stderr or "").strip()
+        stdout_text = (result.stdout or "").strip()
+
+        # ExifTool bazen warning verip yine de işe yarar sonuç üretebilir.
+        # Gerçek hata durumunda exception atalım.
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "Failed to update metadata")
+            message = stderr_text or stdout_text or "Failed to update metadata"
+            raise RuntimeError(message)
 
     def write_filesystem_time(self, path: Path, dt: datetime) -> None:
-        ts = dt.timestamp()
-        os.utime(path, (ts, ts))
-
         if sys.platform.startswith("win"):
             import ctypes
             import ctypes.wintypes as wintypes
@@ -1131,25 +1370,34 @@ class MainWindow(QMainWindow):
                 None,
             )
             if handle == -1 or handle == 0:
-                raise RuntimeError("CreateFileW failed while updating creation time")
+                raise RuntimeError("CreateFileW failed while updating filesystem time")
 
             epoch = datetime(1601, 1, 1)
             delta = dt - epoch
             filetime = int(delta.total_seconds() * 10**7)
 
             class FILETIME(ctypes.Structure):
-                _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+                _fields_ = [
+                    ("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD),
+                ]
 
             ft = FILETIME(filetime & 0xFFFFFFFF, filetime >> 32)
+
             ok = ctypes.windll.kernel32.SetFileTime(
                 handle,
-                ctypes.byref(ft),
-                ctypes.byref(ft),
-                ctypes.byref(ft),
+                ctypes.byref(ft),  # creation time
+                ctypes.byref(ft),  # access time
+                ctypes.byref(ft),  # write time
             )
             ctypes.windll.kernel32.CloseHandle(handle)
+
             if not ok:
-                raise RuntimeError("SetFileTime failed while updating creation time")
+                raise RuntimeError("SetFileTime failed while updating filesystem time")
+
+        else:
+            ts = dt.timestamp()
+            os.utime(path, (ts, ts))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
