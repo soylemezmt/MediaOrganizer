@@ -5,10 +5,18 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from mediaorganizer.file_types import is_supported_media_file
 from mediaorganizer.consistency import get_all_date_sources, analyze_date_consistency
-from mediaorganizer.metadata_reader import read_metadata_dates_with_exiftool
+from mediaorganizer.metadata_reader import (
+    read_metadata_dates_with_exiftool,
+    read_location_fields_with_exiftool,
+)
 
 from .models import MediaRow
 from .utils import fmt_year_month
+
+
+def chunked(seq: list[Path], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
 class FolderScanner(QObject):
@@ -16,39 +24,81 @@ class FolderScanner(QObject):
     scan_failed = Signal(str)
     progress_changed = Signal(int, int)
 
-    @Slot(list, bool, object)
-    def scan_folders(self, folders: list[str], recursive: bool, limit=None) -> None:
+    @Slot(list, bool, object, object)
+    def scan_folders(self, folders: list[str], recursive: bool, limit=None, options=None) -> None:
         try:
             folder_paths = [Path(f) for f in folders]
             media_files = self._collect_media_files(folder_paths, recursive, limit)
 
-            metadata_map = read_metadata_dates_with_exiftool(media_files) if media_files else {}
+            metadata_tag = "DateTimeOriginal"
+            filesystem_time = "ctime"
+            show_country = False
+            show_city = False
+
+            if options is not None:
+                metadata_tag = options.date_sources.metadata_tag
+                filesystem_time = options.date_sources.filesystem_time
+                show_country = options.columns.show_country
+                show_city = options.columns.show_city
+
             checked_sources = ["metadata", "filename", "folder", "filesystem"]
 
             rows: list[MediaRow] = []
             total = len(media_files)
+            processed = 0
+            batch_size = 100
 
-            for i, p in enumerate(media_files, start=1):
-                dates = get_all_date_sources(p, metadata_map.get(p))
-                is_inconsistent, *_ = analyze_date_consistency(
-                    dates=dates,
-                    checked_sources=checked_sources,
-                    compare_level="month",
+            if total == 0:
+                self.progress_changed.emit(0, 0)
+                self.scan_finished.emit(rows)
+                return
+
+            for group in chunked(media_files, batch_size):
+                metadata_map = read_metadata_dates_with_exiftool(
+                    group,
+                    selected_tag=metadata_tag,
                 )
 
-                rows.append(
-                    MediaRow(
-                        path=p,
-                        file_type=p.suffix.lower(),
-                        metadata_date=fmt_year_month(dates.get("metadata")),
-                        filename_date=fmt_year_month(dates.get("filename")),
-                        folder_date=fmt_year_month(dates.get("folder")),
-                        filesystem_date=fmt_year_month(dates.get("filesystem")),
-                        size_bytes=p.stat().st_size,
-                        is_inconsistent=is_inconsistent,
+                location_map = (
+                    read_location_fields_with_exiftool(group)
+                    if (show_country or show_city)
+                    else {}
+                )
+
+                for p in group:
+                    dates = get_all_date_sources(
+                        p,
+                        metadata_map.get(p),
+                        filesystem_preferred=filesystem_time,
                     )
-                )
-                self.progress_changed.emit(i, total)
+
+                    is_inconsistent, *_ = analyze_date_consistency(
+                        dates=dates,
+                        checked_sources=checked_sources,
+                        compare_level="month",
+                    )
+
+                    loc = location_map.get(p, {})
+                    country = str(loc.get("country") or "")
+                    city = str(loc.get("city") or "")
+
+                    rows.append(
+                        MediaRow(
+                            path=p,
+                            file_type=p.suffix.lower(),
+                            metadata_date=fmt_year_month(dates.get("metadata")),
+                            filename_date=fmt_year_month(dates.get("filename")),
+                            folder_date=fmt_year_month(dates.get("folder")),
+                            filesystem_date=fmt_year_month(dates.get("filesystem")),
+                            size_bytes=p.stat().st_size,
+                            is_inconsistent=is_inconsistent,
+                            country=country,
+                            city=city,
+                        )
+                    )
+
+                processed += len(group)
+                self.progress_changed.emit(processed, total)
 
             rows.sort(key=lambda r: str(r.path).lower())
             self.scan_finished.emit(rows)

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QStandardPaths
+from PySide6.QtCore import Qt, QThread, QStandardPaths, Signal
 from PySide6.QtGui import QAction, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +48,7 @@ from .utils import fmt_year_month
 from ..consistency import analyze_date_consistency, get_all_date_sources
 from ..metadata_reader import read_metadata_dates_with_exiftool
 from ..naming import resolve_destination_path
+from .options_dialog import OptionsDialog, UiOptions
 
 
 class FileNameEditDelegate(QStyledItemDelegate):
@@ -61,6 +62,7 @@ class FileNameEditDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
+    request_scan = Signal(list, bool, object)
     DEFAULT_PRIORITY = ["filename", "folder", "metadata", "filesystem", "user_defined"]
 
     VIDEO_EXTENSIONS = {
@@ -195,6 +197,9 @@ class MainWindow(QMainWindow):
         self.priority_down_button.clicked.connect(lambda: self.move_priority_item(+1))
         self._load_default_priority()
 
+        self.ui_options = UiOptions()
+        self.apply_column_settings()
+
         self.selection_count_label = QLabel("You have not selected a file")
 
         self.update_button = QPushButton("Update")
@@ -308,6 +313,12 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+        
+        options_menu = menu_bar.addMenu("Options")
+
+        display_options_action = QAction("Display and Date Options...", self)
+        display_options_action.triggered.connect(self.show_options_dialog)
+        options_menu.addAction(display_options_action)
 
     def _load_default_priority(self) -> None:
         self.priority_list.clear()
@@ -327,6 +338,49 @@ class MainWindow(QMainWindow):
             "user_defined": "User Defined",
         }
         return labels.get(key, key)
+
+    def _display_relative_dir(self, path: Path) -> str:
+        parent = path.parent
+        if self.current_folder is not None:
+            try:
+                rel = parent.relative_to(self.current_folder)
+                text = str(rel).replace("/", "\\")
+                return "" if text == "." else text
+            except Exception:
+                pass
+        return str(parent)
+
+    def apply_column_settings(self) -> None:
+        cols = ["name"]
+
+        c = self.ui_options.columns
+        if c.show_type:
+            cols.append("type")
+        if c.show_metadata:
+            cols.append("metadata")
+        if c.show_filename:
+            cols.append("filename")
+        if c.show_folder:
+            cols.append("folder")
+        if c.show_filesystem:
+            cols.append("filesystem")
+        if c.show_size:
+            cols.append("size")
+        if c.show_path:
+            cols.append("path")
+        if c.show_country:
+            cols.append("country")
+        if c.show_city:
+            cols.append("city")
+
+        self.media_table_model.set_visible_columns(cols)
+
+    def show_options_dialog(self) -> None:
+        dlg = OptionsDialog(self.ui_options, self)
+        if dlg.exec():
+            self.ui_options = dlg.build_options()
+            self.apply_column_settings()
+            self.refresh_selected_folders()
 
     def move_priority_item(self, delta: int) -> None:
         row = self.priority_list.currentRow()
@@ -618,8 +672,11 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 scan_limit = 100
 
-        folder_text = ", ".join(str(p.name) for p in selected_paths)
-        self.statusBar().showMessage(f"Scanning: {folder_text} ...")
+        if estimated_count > 0:
+            shown_total = scan_limit if scan_limit is not None else estimated_count
+            self.statusBar().showMessage(f"Scanning 0 out of {shown_total} files.")
+        else:
+            self.statusBar().showMessage("Scanning...")
         self.preview_label.setText("Scanning...")
         self.preview_label.setPixmap(QPixmap())
         self.show_play_overlay(False)
@@ -632,10 +689,7 @@ class MainWindow(QMainWindow):
         scanner.progress_changed.connect(self.on_scan_progress)
 
         paths_str = [str(p) for p in selected_paths]
-        self.scan_thread.started.connect(
-            lambda scanner=scanner, paths=paths_str, recursive=recursive, scan_limit=scan_limit:
-                scanner.scan_folders(paths, recursive, scan_limit)
-        )
+        self.request_scan.connect(scanner.scan_folders)
 
         scanner.scan_finished.connect(self.on_scan_finished)
         scanner.scan_failed.connect(self.on_scan_failed)
@@ -644,6 +698,7 @@ class MainWindow(QMainWindow):
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
 
         self.scan_thread.start()
+        self.request_scan.emit(paths_str, recursive, scan_limit)
 
     def _on_scan_thread_finished(self) -> None:
         if self.scanner is not None:
@@ -657,10 +712,15 @@ class MainWindow(QMainWindow):
         if self.current_folder is not None:
             for row in rows:
                 try:
-                    rel = row.path.relative_to(self.current_folder)
+                    abs_path = row.path
+                    rel = abs_path.relative_to(self.current_folder)
                     row.path = rel
                 except Exception:
                     pass
+
+                full_path = self.current_folder / row.path if not row.path.is_absolute() else row.path
+                row.relative_dir = self._display_relative_dir(full_path)
+
         self.media_table_model.set_rows(rows)
         self.statusBar().showMessage(f"Loaded {len(rows)} media files.")
         self.preview_label.setText("Preview")

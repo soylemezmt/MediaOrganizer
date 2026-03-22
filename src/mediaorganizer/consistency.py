@@ -68,22 +68,33 @@ def _read_windows_filetime(path: Path) -> Optional[datetime]:
     return datetime(1601, 1, 1) + timedelta(microseconds=us)
 
 
-def get_filesystem_date(path: Path) -> Optional[datetime]:
+def get_filesystem_date(path: Path, preferred: str = "ctime") -> Optional[datetime]:
     try:
         stat = path.stat()
 
-        try:
-            return datetime.fromtimestamp(stat.st_ctime)
-        except Exception:
-            pass
+        if preferred == "ctime":
+            try:
+                return datetime.fromtimestamp(stat.st_ctime)
+            except Exception:
+                pass
 
-        try:
-            return datetime.fromtimestamp(stat.st_mtime)
-        except Exception:
-            pass
+        if preferred == "mtime":
+            try:
+                return datetime.fromtimestamp(stat.st_mtime)
+            except Exception:
+                pass
 
-        if sys.platform.startswith("win"):
-            return _read_windows_filetime(path)
+        if preferred == "windows_creation" and sys.platform.startswith("win"):
+            dt = _read_windows_filetime(path)
+            if dt is not None:
+                return dt
+
+        # fallback
+        for candidate in (stat.st_ctime, stat.st_mtime):
+            try:
+                return datetime.fromtimestamp(candidate)
+            except Exception:
+                pass
 
         return None
     except Exception:
@@ -92,13 +103,14 @@ def get_filesystem_date(path: Path) -> Optional[datetime]:
 
 def get_all_date_sources(
     file_path: Path,
-    metadata_date: Optional[datetime]
+    metadata_date: Optional[datetime],
+    filesystem_preferred: str = "ctime",
 ) -> Dict[str, Optional[datetime]]:
     return {
         "metadata": metadata_date,
         "filename": extract_date_from_text(file_path.name),
         "folder": extract_date_from_folder_hierarchy(file_path),
-        "filesystem": get_filesystem_date(file_path),
+        "filesystem": get_filesystem_date(file_path, preferred=filesystem_preferred),
     }
 
 

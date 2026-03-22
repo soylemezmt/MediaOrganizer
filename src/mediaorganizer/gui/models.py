@@ -16,61 +16,83 @@ class MediaRow:
     filesystem_date: str
     size_bytes: int
     is_inconsistent: bool
+    country: str = ""
+    city: str = ""
+    relative_dir: str = ""
 
 
 class MediaTableModel(QAbstractTableModel):
-    HEADERS = [
-        "Name",
-        "Type",
-        "Metadata",
-        "Filename",
-        "Folder",
-        "Filesystem",
-        "Size",
-        "Path",
+    COLUMN_DEFS = [
+        ("name", "Name"),
+        ("type", "Type"),
+        ("metadata", "Metadata"),
+        ("filename", "Filename"),
+        ("folder", "Folder"),
+        ("filesystem", "Filesystem"),
+        ("size", "Size"),
+        ("path", "Path"),
+        ("country", "Country"),
+        ("city", "City"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[MediaRow] = []
+        self.visible_columns = [
+            "name", "metadata", "filename", "folder", "filesystem", "size", "path"
+        ]
+
+    def set_visible_columns(self, columns: list[str]) -> None:
+        self.beginResetModel()
+        self.visible_columns = columns
+        self.endResetModel()
 
     def set_rows(self, rows: list[MediaRow]) -> None:
         self.beginResetModel()
         self.rows = rows
         self.endResetModel()
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.rows)
 
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self.HEADERS)
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.visible_columns)
 
-    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
+    def _header_for_key(self, key: str) -> str:
+        for k, title in self.COLUMN_DEFS:
+            if k == key:
+                return title
+        return key
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
-            return self.HEADERS[section]
+            if 0 <= section < len(self.visible_columns):
+                return self._header_for_key(self.visible_columns[section])
         return str(section + 1)
 
-    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+    def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
 
         row = self.rows[index.row()]
-        col = index.column()
+        key = self.visible_columns[index.column()]
 
         if role in (Qt.DisplayRole, Qt.EditRole):
-            values = [
-                row.path.name,
-                row.file_type,
-                row.metadata_date,
-                row.filename_date,
-                row.folder_date,
-                row.filesystem_date,
-                f"{row.size_bytes:,}",
-                str(row.path),
-            ]
-            return values[col]
+            values = {
+                "name": row.path.name,
+                "type": row.file_type,
+                "metadata": row.metadata_date,
+                "filename": row.filename_date,
+                "folder": row.folder_date,
+                "filesystem": row.filesystem_date,
+                "size": f"{row.size_bytes:,}",
+                "path": row.relative_dir,
+                "country": row.country,
+                "city": row.city,
+            }
+            return values.get(key, "")
 
         if role == Qt.BackgroundRole and row.is_inconsistent:
             return QColor("#ffcc80")
@@ -78,17 +100,17 @@ class MediaTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole and row.is_inconsistent:
             return QColor("#000000")
 
-        if role == Qt.TextAlignmentRole and col == 6:
+        if role == Qt.TextAlignmentRole and key == "size":
             return int(Qt.AlignRight | Qt.AlignVCenter)
 
         return None
 
-    def flags(self, index: QModelIndex):
+    def flags(self, index):
         if not index.isValid():
             return Qt.NoItemFlags
 
         flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        if index.column() == 0:
+        if self.visible_columns[index.column()] == "name":
             flags |= Qt.ItemIsEditable
         return flags
 
