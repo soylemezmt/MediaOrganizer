@@ -44,7 +44,7 @@ from .folderListTable import FolderListTable
 from .models import MediaRow, MediaTableModel
 from .scanner import FolderScanner
 from .updatePreview import UpdatePreviewDialog
-from .utils import fmt_year_month
+from .utils import fmt_year_month, check_internet_connection
 from ..consistency import analyze_date_consistency, get_all_date_sources
 from ..metadata_reader import (
     read_metadata_dates_with_exiftool,
@@ -52,6 +52,7 @@ from ..metadata_reader import (
 )
 from ..naming import resolve_destination_path
 from .options_dialog import OptionsDialog, UiOptions
+from mediaorganizer.location_utils import infer_country_city_from_gps
 
 
 class FileNameEditDelegate(QStyledItemDelegate):
@@ -81,6 +82,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Media Organizer UI")
         self.resize(1600, 950)
+        self.internet_available = False
 
         self.all_media_rows = []
         
@@ -136,12 +138,35 @@ class MainWindow(QMainWindow):
         self.preview_label.setMinimumSize(500, 420)
         self.preview_label.setStyleSheet("border: 1px solid #999; background: #fafafa;")
         
-        self.info_panel_visible = False
+        self.info_panel_visible = True
+        
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.info_group = QGroupBox("File Information")
+        title_label = QLabel("File Information")
+
+        self.info_close_button = QPushButton("✕")
+        self.info_close_button.setFixedSize(20, 20)
+        self.info_close_button.setStyleSheet("""
+            QPushButton {
+                border: none;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                color: red;
+            }
+        """)
+        self.info_close_button.setText("✖")
+        self.info_close_button.clicked.connect(self._close_info_panel)
+
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        header_layout.addWidget(self.info_close_button)
+
+        self.info_group = QGroupBox()
         self.info_group.setMinimumWidth(320)
 
-        info_form = QFormLayout(self.info_group)
+        info_form = QFormLayout()
 
         self.info_name_label = QLabel("")
         self.info_name_label.setWordWrap(True)
@@ -181,6 +206,10 @@ class MainWindow(QMainWindow):
         info_form.addRow("Created", self.info_created_label)
         info_form.addRow("Modified", self.info_modified_label)
         info_form.addRow("Accessed", self.info_accessed_label)
+        
+        info_layout = QVBoxLayout(self.info_group)
+        info_layout.addLayout(header_layout)
+        info_layout.addLayout(info_form)
 
         self.play_overlay_button = QPushButton("▶", self.preview_label)
         self.play_overlay_button.setFixedSize(72, 72)
@@ -364,6 +393,11 @@ class MainWindow(QMainWindow):
                 self.set_folder(default_path)
             else:
                 self.set_folder(Path.home())
+                
+        self.internet_available = check_internet_connection()
+
+        if not self.internet_available:
+            self.statusBar().showMessage("No internet connection. Location lookup disabled.")
 
     def _create_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -437,6 +471,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         return str(parent)
+
+    def _close_info_panel(self) -> None:
+        self.info_panel_visible = False
+        self.info_group.hide()
+
+        if hasattr(self, "toggle_info_panel_action"):
+            self.toggle_info_panel_action.setChecked(False)
+
+        self.preview_info_splitter.setSizes([1000, 0])
 
     def apply_row_filters(self) -> None:
         rows = list(self.all_media_rows)
@@ -520,10 +563,23 @@ class MainWindow(QMainWindow):
             self.info_accessed_label.setText("")
 
         location = self.get_location_for_path(path)
-        self.info_country_label.setText(str(location.get("country") or ""))
-        self.info_city_label.setText(str(location.get("city") or ""))
-        self.info_latitude_label.setText(str(location.get("gps_lat") or ""))
-        self.info_longitude_label.setText(str(location.get("gps_lon") or ""))
+
+        country = str(location.get("country") or "")
+        city = str(location.get("city") or "")
+        gps_lat = str(location.get("gps_lat") or "")
+        gps_lon = str(location.get("gps_lon") or "")
+
+        if (not country or not city) and gps_lat and gps_lon and self.internet_available:
+            inferred_country, inferred_city = infer_country_city_from_gps(gps_lat, gps_lon)
+            if not country:
+                country = inferred_country
+            if not city:
+                city = inferred_city
+
+        self.info_country_label.setText(country)
+        self.info_city_label.setText(city)
+        self.info_latitude_label.setText(gps_lat)
+        self.info_longitude_label.setText(gps_lon)
 
     def show_options_dialog(self) -> None:
         dlg = OptionsDialog(self.ui_options, self)
