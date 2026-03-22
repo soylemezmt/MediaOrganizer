@@ -113,7 +113,7 @@ def read_location_fields_with_exiftool(files: List[Path]) -> Dict[Path, Dict[str
     if not files or not _probe_exiftool():
         return result
 
-    for group in chunked(files, 300):
+    for group in chunked(files, 100):
         cmd = [
             "exiftool",
             "-j",

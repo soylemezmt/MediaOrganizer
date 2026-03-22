@@ -62,7 +62,7 @@ class FileNameEditDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
-    request_scan = Signal(list, bool, object)
+    request_scan = Signal(list, bool, object, object)
     DEFAULT_PRIORITY = ["filename", "folder", "metadata", "filesystem", "user_defined"]
 
     VIDEO_EXTENSIONS = {
@@ -79,6 +79,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Media Organizer UI")
         self.resize(1600, 950)
 
+        self.all_media_rows = []
+        
         self.current_folder: Optional[Path] = None
         self.scan_thread: Optional[QThread] = None
         self.scanner: Optional[FolderScanner] = None
@@ -104,6 +106,10 @@ class MainWindow(QMainWindow):
         self.recursive_checkbox = QCheckBox("Include subfolders")
         self.recursive_checkbox.setChecked(False)
         self.recursive_checkbox.stateChanged.connect(self.refresh_selected_folders)
+        
+        self.show_conflicts_only_checkbox = QCheckBox("Show only conflicting rows")
+        self.show_conflicts_only_checkbox.setChecked(False)
+        self.show_conflicts_only_checkbox.toggled.connect(self.apply_row_filters)
 
         self.media_table_model = MediaTableModel()
         self.media_table = QTableView()
@@ -258,7 +264,14 @@ class MainWindow(QMainWindow):
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.addWidget(self.folder_list, 2)
-        left_layout.addWidget(self.recursive_checkbox, 0)
+        
+        checkbox_layout = QHBoxLayout()
+        checkbox_layout.addWidget(self.recursive_checkbox)
+        checkbox_layout.addWidget(self.show_conflicts_only_checkbox)
+        checkbox_layout.addStretch()  # sağa boşluk bırakır (opsiyonel)
+
+        left_layout.addLayout(checkbox_layout)
+        
         left_layout.addWidget(self.media_table, 3)
 
         right_widget = QWidget()
@@ -349,6 +362,21 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         return str(parent)
+
+    def apply_row_filters(self) -> None:
+        rows = list(self.all_media_rows)
+
+        if self.show_conflicts_only_checkbox.isChecked():
+            rows = [row for row in rows if row.is_inconsistent]
+
+        self.media_table_model.set_rows(rows)
+
+        if rows:
+            self.media_table.selectRow(0)
+        else:
+            self.preview_label.setText("Preview")
+            self.preview_label.setPixmap(QPixmap())
+            self.clear_details_panel()
 
     def apply_column_settings(self) -> None:
         cols = ["name"]
@@ -698,7 +726,7 @@ class MainWindow(QMainWindow):
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
 
         self.scan_thread.start()
-        self.request_scan.emit(paths_str, recursive, scan_limit)
+        self.request_scan.emit(paths_str, recursive, scan_limit, self.ui_options)
 
     def _on_scan_thread_finished(self) -> None:
         if self.scanner is not None:
@@ -721,7 +749,9 @@ class MainWindow(QMainWindow):
                 full_path = self.current_folder / row.path if not row.path.is_absolute() else row.path
                 row.relative_dir = self._display_relative_dir(full_path)
 
-        self.media_table_model.set_rows(rows)
+        self.all_media_rows = rows
+        self.apply_row_filters()
+        
         self.statusBar().showMessage(f"Loaded {len(rows)} media files.")
         self.preview_label.setText("Preview")
         self.preview_label.setPixmap(QPixmap())

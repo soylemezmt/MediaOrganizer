@@ -55,8 +55,8 @@ class OptionsDialog(QDialog):
         columns_layout.addRow("Filesystem", self.chk_filesystem)
         columns_layout.addRow("Size", self.chk_size)
         columns_layout.addRow("Path", self.chk_path)
-        columns_layout.addRow("Country", self.chk_country)
-        columns_layout.addRow("City", self.chk_city)
+        columns_layout.addRow("Country/Longitude", self.chk_country)
+        columns_layout.addRow("City/Latitude", self.chk_city)
 
         date_group = QGroupBox("Date Source Options")
         date_layout = QFormLayout(date_group)

@@ -79,8 +79,8 @@ class FolderScanner(QObject):
                     )
 
                     loc = location_map.get(p, {})
-                    country = str(loc.get("country") or "")
-                    city = str(loc.get("city") or "")
+                    country = str(loc.get("country") or loc.get("gps_lon") or "")
+                    city = str(loc.get("city") or loc.get("gps_lat") or "")
 
                     rows.append(
                         MediaRow(

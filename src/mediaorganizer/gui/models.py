@@ -31,8 +31,8 @@ class MediaTableModel(QAbstractTableModel):
         ("filesystem", "Filesystem"),
         ("size", "Size"),
         ("path", "Path"),
-        ("country", "Country"),
-        ("city", "City"),
+        ("country", "Country/Longitude"),
+        ("city", "City/Latitude"),
     ]
 
     def __init__(self) -> None:
