@@ -6,11 +6,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QStandardPaths, Signal
+from PIL import Image
+
+from PySide6.QtCore import Qt, QThread, QStandardPaths, Signal, QProcess, QTimer
 from PySide6.QtGui import QAction, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,12 +51,20 @@ from ..consistency import analyze_date_consistency, get_all_date_sources
 from ..metadata_reader import (
     read_metadata_dates_with_exiftool,
     read_location_fields_with_exiftool,
+    read_exiftool_date_fields,
 )
 from ..naming import resolve_destination_path
-from .options_dialog import OptionsDialog, UiOptions
+from .options_dialog import OptionsDialog
 from mediaorganizer.location_utils import infer_country_city_from_gps
 from .filter import MediaFilterProxyModel, HeaderFilterPopup, FilterHeaderView
-
+from ..exiftool_utils import exiftool_run, exiftool_run_with_files, exiftool_base_cmd
+from mediaorganizer.config import SUPPORTED_IMAGE_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS
+from .duplicate_options_dialog import DuplicateOptionsDialog
+from ..duplicates import (
+    duplicate_scope_applies,
+    resolve_duplicate_for_destination,
+)
+from .settings import UiOptions
 
 class FileNameEditDelegate(QStyledItemDelegate):
     def __init__(self, owner, parent=None) -> None:
@@ -70,14 +80,8 @@ class MainWindow(QMainWindow):
     request_scan = Signal(list, bool, object, object)
     DEFAULT_PRIORITY = ["filename", "folder", "metadata", "filesystem", "user_defined"]
 
-    VIDEO_EXTENSIONS = {
-        ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts", ".3gp", ".wmv", ".webm",
-        ".mpg", ".mpeg"
-    }
-
-    IMAGE_EXTENSIONS = {
-        ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"
-    }
+    IMAGE_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS
+    VIDEO_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS
 
     def __init__(self) -> None:
         super().__init__()
@@ -86,6 +90,14 @@ class MainWindow(QMainWindow):
         self.internet_available = False
 
         self.all_media_rows = []
+        
+        self.rotate_process: Optional[QProcess] = None
+        self.rotate_target_path: Optional[Path] = None
+        self.rotate_temp_path: Optional[Path] = None
+        self.rotate_backup_path: Optional[Path] = None
+        self.rotate_saved_info: Optional[dict] = None
+        self.rotate_duration_ms: Optional[int] = None
+        self.rotate_stderr_buffer = ""
         
         self.current_folder: Optional[Path] = None
         self.scan_thread: Optional[QThread] = None
@@ -176,7 +188,7 @@ class MainWindow(QMainWindow):
         self.info_group = QGroupBox()
         self.info_group.setMinimumWidth(320)
 
-        info_form = QFormLayout()
+        self.info_form = QFormLayout()
 
         self.info_name_label = QLabel("")
         self.info_name_label.setWordWrap(True)
@@ -191,6 +203,14 @@ class MainWindow(QMainWindow):
         self.info_filename_date_label = QLabel("")
         self.info_folder_date_label = QLabel("")
         self.info_filesystem_date_label = QLabel("")
+        
+        self.info_exif_datetimeoriginal_label = QLabel("")
+        self.info_exif_createdate_label = QLabel("")
+        self.info_exif_mediacreatedate_label = QLabel("")
+        self.info_exif_trackcreatedate_label = QLabel("")
+        self.info_exif_creationdate_label = QLabel("")
+        self.info_exif_modifydate_label = QLabel("")
+        self.info_exif_filemodifydate_label = QLabel("")        
 
         self.info_country_label = QLabel("")
         self.info_city_label = QLabel("")
@@ -201,25 +221,32 @@ class MainWindow(QMainWindow):
         self.info_modified_label = QLabel("")
         self.info_accessed_label = QLabel("")
 
-        info_form.addRow("Name", self.info_name_label)
-        info_form.addRow("Full path", self.info_full_path_label)
-        info_form.addRow("Type", self.info_type_label)
-        info_form.addRow("Size", self.info_size_label)
-        info_form.addRow("Metadata date", self.info_metadata_date_label)
-        info_form.addRow("Filename date", self.info_filename_date_label)
-        info_form.addRow("Folder date", self.info_folder_date_label)
-        info_form.addRow("Filesystem date", self.info_filesystem_date_label)
-        info_form.addRow("Country", self.info_country_label)
-        info_form.addRow("City", self.info_city_label)
-        info_form.addRow("Latitude", self.info_latitude_label)
-        info_form.addRow("Longitude", self.info_longitude_label)
-        info_form.addRow("Created", self.info_created_label)
-        info_form.addRow("Modified", self.info_modified_label)
-        info_form.addRow("Accessed", self.info_accessed_label)
+        self.info_form.addRow("Name", self.info_name_label)
+        self.info_form.addRow("Full path", self.info_full_path_label)
+        self.info_form.addRow("Type", self.info_type_label)
+        self.info_form.addRow("Size", self.info_size_label)
+        self.info_form.addRow("Metadata date", self.info_metadata_date_label)
+        self.info_form.addRow("Filename date", self.info_filename_date_label)
+        self.info_form.addRow("DateTimeOriginal", self.info_exif_datetimeoriginal_label)
+        self.info_form.addRow("CreateDate", self.info_exif_createdate_label)
+        self.info_form.addRow("MediaCreateDate", self.info_exif_mediacreatedate_label)
+        self.info_form.addRow("TrackCreateDate", self.info_exif_trackcreatedate_label)
+        self.info_form.addRow("CreationDate", self.info_exif_creationdate_label)
+        self.info_form.addRow("ModifyDate", self.info_exif_modifydate_label)
+        self.info_form.addRow("FileModifyDate", self.info_exif_filemodifydate_label)        
+        self.info_form.addRow("Folder date", self.info_folder_date_label)
+        self.info_form.addRow("Filesystem date", self.info_filesystem_date_label)
+        self.info_form.addRow("Country", self.info_country_label)
+        self.info_form.addRow("City", self.info_city_label)
+        self.info_form.addRow("Latitude", self.info_latitude_label)
+        self.info_form.addRow("Longitude", self.info_longitude_label)
+        self.info_form.addRow("Created", self.info_created_label)
+        self.info_form.addRow("Modified", self.info_modified_label)
+        self.info_form.addRow("Accessed", self.info_accessed_label)
         
         info_layout = QVBoxLayout(self.info_group)
         info_layout.addLayout(header_layout)
-        info_layout.addLayout(info_form)
+        info_layout.addLayout(self.info_form)
 
         self.play_overlay_button = QPushButton("▶", self.preview_label)
         self.play_overlay_button.setFixedSize(72, 72)
@@ -238,7 +265,53 @@ class MainWindow(QMainWindow):
                 background-color: rgba(0, 0, 0, 180);
             }
         """)
+        
+        self.rotate_ccw_button = QPushButton("↶", self.preview_label)
+        self.rotate_ccw_button.setToolTip("Rotate 90° counterclockwise")
+        self.rotate_ccw_button.setFixedSize(40, 34)
+        self.rotate_ccw_button.clicked.connect(lambda: self.rotate_selected_media(-90))
 
+        self.rotate_cw_button = QPushButton("↷", self.preview_label)
+        self.rotate_cw_button.setToolTip("Rotate 90° clockwise")
+        self.rotate_cw_button.setFixedSize(40, 34)
+        self.rotate_cw_button.clicked.connect(lambda: self.rotate_selected_media(+90))
+        
+        style = """
+        QPushButton {
+            background-color: rgba(0, 0, 0, 120);
+            color: white;
+            border: 1px solid white;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: rgba(0, 0, 0, 170);
+        }
+        """
+
+        self.rotate_ccw_button.setStyleSheet(style)
+        self.rotate_cw_button.setStyleSheet(style)
+
+        self.info_toggle_button = QPushButton("ℹ", self.preview_label)
+        self.info_toggle_button.setFixedSize(34, 34)
+        self.info_toggle_button.setToolTip("Show File Information")
+        self.info_toggle_button.clicked.connect(self._open_info_panel)
+        self.info_toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 120);
+                color: white;
+                border: 1px solid white;
+                border-radius: 17px;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 170);
+            }
+        """)
+        self.info_toggle_button.hide()
+        
         self.metadata_value_label = QLabel("")
         self.filename_value_label = QLabel("")
         self.folder_value_label = QLabel("")
@@ -276,7 +349,7 @@ class MainWindow(QMainWindow):
         self.target_folder_button.clicked.connect(self.choose_target_folder)
 
         self.preview_changes_check = QCheckBox("Preview changes before update")
-        self.preview_changes_check.setChecked(True)
+        self.preview_changes_check.setChecked(False)
 
         self.priority_list = QListWidget()
         self.priority_list.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -365,7 +438,9 @@ class MainWindow(QMainWindow):
         preview_container = QWidget()
         preview_container_layout = QVBoxLayout(preview_container)
         preview_container_layout.setContentsMargins(0, 0, 0, 0)
+
         preview_container_layout.addWidget(self.preview_label)
+
 
         self.preview_info_splitter = QSplitter(Qt.Horizontal)
         self.preview_info_splitter.addWidget(preview_container)
@@ -373,7 +448,7 @@ class MainWindow(QMainWindow):
         self.preview_info_splitter.setStretchFactor(0, 4)
         self.preview_info_splitter.setStretchFactor(1, 2)
         
-        self.info_group.hide()
+        self.info_group.show()
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -408,6 +483,8 @@ class MainWindow(QMainWindow):
 
         if not self.internet_available:
             self.statusBar().showMessage("No internet connection. Location lookup disabled.")
+        
+        self._update_info_toggle_button()
 
     def _create_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -439,11 +516,15 @@ class MainWindow(QMainWindow):
         display_options_action.triggered.connect(self.show_options_dialog)
         options_menu.addAction(display_options_action)
         
+        duplicate_options_action = QAction("Duplicate Files...", self)
+        duplicate_options_action.triggered.connect(self.show_duplicate_options_dialog)
+        options_menu.addAction(duplicate_options_action)
+        
         view_menu = menu_bar.addMenu("View")
 
         self.toggle_info_panel_action = QAction("Show Info Panel", self)
         self.toggle_info_panel_action.setCheckable(True)
-        self.toggle_info_panel_action.setChecked(False)
+        self.toggle_info_panel_action.setChecked(True)
         self.toggle_info_panel_action.triggered.connect(self.toggle_info_panel)
 
         view_menu.addAction(self.toggle_info_panel_action)
@@ -482,6 +563,37 @@ class MainWindow(QMainWindow):
                 pass
         return str(parent)
 
+    def _set_rotate_buttons_enabled(self, enabled: bool) -> None:
+        self.rotate_ccw_button.setEnabled(enabled)
+        self.rotate_cw_button.setEnabled(enabled)
+
+    def _position_overlay_buttons(self) -> None:
+        self._position_play_overlay_button()
+        self._position_rotate_buttons()
+        self._update_info_toggle_button()
+
+    def _position_play_overlay_button(self) -> None:
+        btn = self.play_overlay_button
+        parent = self.preview_label
+        x = max(0, (parent.width() - btn.width()) // 2)
+        y = max(0, (parent.height() - btn.height()) // 2)
+        btn.move(x, y)
+
+    def _update_info_toggle_button(self) -> None:
+        if self.info_panel_visible:
+            self.info_toggle_button.hide()
+            return
+
+        parent = self.preview_label
+        btn = self.info_toggle_button
+
+        margin = 10
+        x = max(0, parent.width() - btn.width() - margin)
+        y = margin
+        btn.move(x, y)
+        btn.show()
+        btn.raise_()    
+
     def _close_info_panel(self) -> None:
         self.info_panel_visible = False
         self.info_group.hide()
@@ -490,6 +602,632 @@ class MainWindow(QMainWindow):
             self.toggle_info_panel_action.setChecked(False)
 
         self.preview_info_splitter.setSizes([1000, 0])
+        self._update_info_toggle_button()
+        self._position_overlay_buttons()
+
+    def _open_info_panel(self) -> None:
+        self.info_panel_visible = True
+        self.info_group.show()
+
+        if hasattr(self, "toggle_info_panel_action"):
+            self.toggle_info_panel_action.setChecked(True)
+
+        self.preview_info_splitter.setSizes([700, 320])
+
+        if self.current_info_path is not None:
+            self.populate_info_panel(self.current_info_path)
+
+        self._update_info_toggle_button()
+        self._position_overlay_buttons()
+
+    def _set_info_row_visible(self, form_layout: QFormLayout, label_widget: QWidget, visible: bool) -> None:
+        for i in range(form_layout.rowCount()):
+            item = form_layout.itemAt(i, QFormLayout.FieldRole)
+            if item and item.widget() is label_widget:
+                label_item = form_layout.itemAt(i, QFormLayout.LabelRole)
+
+                if label_item and label_item.widget():
+                    label_item.widget().setVisible(visible)
+
+                label_widget.setVisible(visible)
+                break
+
+    def _is_video_file(self, path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".3gp", ".mts", ".m2ts"
+        }
+
+    def _is_image_file(self, path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".webp", ".bmp"
+        }   
+
+    def _is_rotatable_image(self, path: Path) -> bool:
+        return path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+    def _is_rotatable_video(self, path: Path) -> bool:
+        return path.suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".3gp"}
+
+    def _position_rotate_buttons(self) -> None:
+        parent = self.preview_label
+
+        margin = 10
+        spacing = 6
+
+        btn_w = self.rotate_ccw_button.width()
+        btn_h = self.rotate_ccw_button.height()
+
+        # sol alt
+        x = margin
+        y_bottom = parent.height() - margin - btn_h
+
+        # alt buton (clockwise)
+        self.rotate_cw_button.move(x, y_bottom)
+
+        # üst buton (counter-clockwise)
+        self.rotate_ccw_button.move(x, y_bottom - btn_h - spacing)
+
+        self.rotate_ccw_button.raise_()
+        self.rotate_cw_button.raise_()
+
+    def _handle_duplicate_decision_for_rename(self, decision, source_path: Path):
+        """
+        duplicate policy kararı geldiğinde rename işlemi için GUI seviyesinde ne yapılacağını belirler.
+        Geri dönüş:
+            ("skip", None)
+            ("rename", target_path)
+            ("normal", None)
+        """
+        if decision is None:
+            return "normal", None
+
+        if decision.action == "skip":
+            return "skip", None
+
+        if decision.action == "rename_copy_or_move":
+            return "rename", decision.target_path
+
+        if decision.action == "replace_with_incoming":
+            return "rename", decision.target_path
+
+        if decision.action == "keep_existing_best":
+            return "skip", None
+
+        if decision.action == "ask":
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("Duplicate file found")
+            msg.setText(f"A duplicate file was found for:\n{source_path.name}")
+            msg.setInformativeText(
+                "What would you like to do?\n\n"
+                "Yes = Keep both (rename this file)\n"
+                "No = Skip renaming this file\n"
+                "Cancel = Cancel this file"
+            )
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            msg.setDefaultButton(QMessageBox.Yes)
+
+            result = msg.exec()
+
+            if result == QMessageBox.Yes:
+                return "rename", decision.target_path
+            if result == QMessageBox.No:
+                return "skip", None
+            return "skip", None
+
+        return "normal", None
+
+    def _handle_duplicate_decision_for_move(self, decision, source_path: Path):
+        """
+        duplicate policy kararı geldiğinde move işlemi için GUI seviyesinde ne yapılacağını belirler.
+        Geri dönüş:
+            ("skip", None)
+            ("move", target_path)
+            ("normal", None)
+        """
+        if decision is None:
+            return "normal", None
+
+        if decision.action == "skip":
+            return "skip", None
+
+        if decision.action == "rename_copy_or_move":
+            return "move", decision.target_path
+
+        if decision.action == "replace_with_incoming":
+            return "move", decision.target_path
+
+        if decision.action == "keep_existing_best":
+            return "skip", None
+
+        if decision.action == "ask":
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("Duplicate file found")
+            msg.setText(f"A duplicate file was found for:\n{source_path.name}")
+            msg.setInformativeText(
+                "What would you like to do?\n\n"
+                "Yes = Keep both (rename moved file)\n"
+                "No = Skip moving this file\n"
+                "Cancel = Cancel this file"
+            )
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            msg.setDefaultButton(QMessageBox.Yes)
+
+            result = msg.exec()
+
+            if result == QMessageBox.Yes:
+                return "move", decision.target_path
+            if result == QMessageBox.No:
+                return "skip", None
+            return "skip", None
+
+        return "normal", None
+
+    def _handle_duplicate_decision_for_copy(self, decision, source_path: Path):
+        """
+        duplicate policy kararı geldiğinde copy işlemi için GUI seviyesinde ne yapılacağını belirler.
+        Geri dönüş:
+            ("skip", None)
+            ("copy", target_path)
+            ("normal", None)   # duplicate policy karar üretmedi / normal akışa dön
+        """
+        if decision is None:
+            return "normal", None
+
+        if decision.action == "skip":
+            return "skip", None
+
+        if decision.action == "rename_copy_or_move":
+            return "copy", decision.target_path
+
+        if decision.action == "replace_with_incoming":
+            return "copy", decision.target_path
+
+        if decision.action == "keep_existing_best":
+            return "skip", None
+
+        if decision.action == "ask":
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Question)
+            msg.setWindowTitle("Duplicate file found")
+            msg.setText(f"A duplicate file was found for:\n{source_path.name}")
+            msg.setInformativeText(
+                "What would you like to do?\n\n"
+                "Yes = Keep both (rename incoming copy)\n"
+                "No = Skip incoming file\n"
+                "Cancel = Cancel this file"
+            )
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            msg.setDefaultButton(QMessageBox.Yes)
+
+            result = msg.exec()
+
+            if result == QMessageBox.Yes:
+                return "copy", decision.target_path
+            if result == QMessageBox.No:
+                return "skip", None
+            return "skip", None
+
+        return "normal", None
+
+
+    def _capture_all_date_info(self, path: Path) -> dict:
+        info = {
+            "filesystem": None,
+            "exif_dates": {},
+        }
+
+        dates = self.get_dates_for_path(path)
+        info["filesystem"] = dates.get("filesystem")
+
+        exif_map = read_exiftool_date_fields([path])
+        info["exif_dates"] = exif_map.get(path, {}) or {}
+
+        return info
+
+    def _restore_exif_dates(self, path: Path, exif_dates: dict) -> None:
+        if not exif_dates:
+            return
+
+        cmd = exiftool_base_cmd("-overwrite_original")
+
+        has_any_tag = False
+        for tag in [
+            "DateTimeOriginal",
+            "CreateDate",
+            "MediaCreateDate",
+            "TrackCreateDate",
+            "CreationDate",
+            "ModifyDate",
+            "FileModifyDate",
+        ]:
+            value = (exif_dates.get(tag) or "").strip()
+            if value:
+                cmd.append(f"-{tag}={value}")
+                has_any_tag = True
+                
+        if not has_any_tag:
+            return
+
+        cmd.append(str(path))
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="cp1254",
+            errors="replace",
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ExifTool date restore failed")
+        
+    def _restore_all_date_info(self, path: Path, saved_info: dict) -> None:
+        exif_dates = saved_info.get("exif_dates") or {}
+        filesystem_dt = saved_info.get("filesystem")
+
+        self._restore_exif_dates(path, exif_dates)
+
+        if filesystem_dt is not None:
+            self.write_filesystem_time(path, filesystem_dt)
+            
+    def _rotate_image_file(self, path: Path, angle: int) -> None:
+        direction = "clockwise" if angle > 0 else "counterclockwise"
+        self.statusBar().showMessage(f"Rotating image {direction}: {path.name} ...")
+        QApplication.processEvents()
+
+        saved_info = self._capture_all_date_info(path)
+
+        suffix = path.suffix
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=suffix,
+            prefix=path.stem + "_tmp_",
+            dir=str(path.parent),
+        )
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+
+        try:
+            with Image.open(path) as img:
+                exif = img.info.get("exif")
+                rotated = img.rotate(-angle, expand=True)
+
+                save_kwargs = {}
+                if exif:
+                    save_kwargs["exif"] = exif
+
+                rotated.save(tmp_path, **save_kwargs)
+
+            tmp_path.replace(path)
+            self._restore_all_date_info(path, saved_info)
+
+            self.statusBar().showMessage(f"Image rotated: {path.name}", 5000)
+
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            self.statusBar().showMessage(f"Image rotation failed: {path.name}", 5000)
+            raise
+
+    def _rotate_video_file(self, path: Path, angle: int) -> None:
+        saved_info = self._capture_all_date_info(path)
+
+        suffix = path.suffix
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=suffix,
+            prefix=path.stem + "_tmp_",
+            dir=str(path.parent),
+        )
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+
+        old_path = path.with_suffix(path.suffix + ".old_rotate_backup")
+
+        try:
+            transpose_value = "1" if angle == 90 else "2"
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-vf",
+                f"transpose={transpose_value}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "copy",
+                str(tmp_path),
+            ]
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="cp1254",
+                errors="replace",
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "ffmpeg rotate failed")
+
+            if old_path.exists():
+                old_path.unlink()
+
+            path.replace(old_path)
+            tmp_path.replace(path)
+
+            self._restore_all_date_info(path, saved_info)
+
+            if old_path.exists():
+                old_path.unlink()
+
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+            if old_path.exists() and not path.exists():
+                try:
+                    old_path.replace(path)
+                except Exception:
+                    pass
+
+            raise
+
+    def _hhmmss_to_ms(self, text: str) -> int:
+        # örn: 00:01:23.45
+        hh, mm, ss = text.split(":")
+        total_seconds = int(hh) * 3600 + int(mm) * 60 + float(ss)
+        return int(total_seconds * 1000)
+
+    def _start_video_rotation(self, path: Path, angle: int) -> None:
+        if self.rotate_process is not None:
+            QMessageBox.information(self, "Rotate", "Another video rotation is already running.")
+            return
+
+        self._set_rotate_buttons_enabled(False)
+
+        saved_info = self._capture_all_date_info(path)
+
+        suffix = path.suffix
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=suffix,
+            prefix=path.stem + "_tmp_",
+            dir=str(path.parent),
+        )
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+
+        old_path = path.with_suffix(path.suffix + ".old_rotate_backup")
+        if old_path.exists():
+            try:
+                old_path.unlink()
+            except Exception:
+                pass
+
+        transpose_value = "1" if angle == 90 else "2"
+        direction = "clockwise" if angle > 0 else "counterclockwise"
+
+        self.rotate_target_path = path
+        self.rotate_temp_path = tmp_path
+        self.rotate_backup_path = old_path
+        self.rotate_saved_info = saved_info
+        self.rotate_duration_ms = None
+        self.rotate_stderr_buffer = ""
+
+        self.statusBar().showMessage(f"Rotating video {direction}: {path.name} ... 0%")
+
+        process = QProcess(self)
+        self.rotate_process = process
+
+        process.setProgram("ffmpeg")
+        process.setArguments([
+            "-y",
+            "-i", str(path),
+            "-progress", "pipe:2",
+            "-nostats",
+            "-vf", f"transpose={transpose_value}",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-c:a", "copy",
+            str(tmp_path),
+        ])
+
+        process.readyReadStandardError.connect(self._on_rotate_process_stderr)
+        process.finished.connect(self._on_rotate_process_finished)
+
+        process.start()
+
+    def _on_rotate_process_finished(self, exit_code: int, exit_status) -> None:
+        process = self.rotate_process
+        path = self.rotate_target_path
+        tmp_path = self.rotate_temp_path
+        old_path = self.rotate_backup_path
+        saved_info = self.rotate_saved_info
+
+        self.rotate_process = None
+        self.rotate_target_path = None
+        self.rotate_temp_path = None
+        self.rotate_backup_path = None
+        self.rotate_saved_info = None
+        self.rotate_duration_ms = None
+        self.rotate_stderr_buffer = ""
+
+        try:
+            if process is None or path is None or tmp_path is None or old_path is None or saved_info is None:
+                self.statusBar().showMessage("Video rotation failed.", 5000)
+                return
+
+            if exit_code != 0:
+                err = ""
+                try:
+                    err = bytes(process.readAllStandardError()).decode("cp1254", errors="ignore")
+                except Exception:
+                    pass
+
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
+                self.statusBar().showMessage(f"Video rotation failed: {path.name}", 5000)
+                QMessageBox.warning(
+                    self,
+                    "Rotate",
+                    f"Could not rotate video:\n{err or 'ffmpeg failed.'}"
+                )
+                return
+
+            if old_path.exists():
+                try:
+                    old_path.unlink()
+                except Exception:
+                    pass
+
+            path.replace(old_path)
+            tmp_path.replace(path)
+
+            self._restore_all_date_info(path, saved_info)
+
+            if old_path.exists():
+                try:
+                    old_path.unlink()
+                except Exception:
+                    pass
+
+            self.statusBar().showMessage(f"Video rotated: {path.name}", 5000)
+
+            self.extract_video_thumbnail(path)
+            self.show_preview(path)
+            self.populate_details_panel(path)
+            if self.info_panel_visible:
+                self.populate_info_panel(path)
+
+        except Exception as exc:
+            # mümkünse geri alma
+            try:
+                if old_path is not None and old_path.exists() and path is not None and not path.exists():
+                    old_path.replace(path)
+            except Exception:
+                pass
+
+            self.statusBar().showMessage("Video rotation failed.", 5000)
+            QMessageBox.warning(
+                self,
+                "Rotate",
+                f"Could not finalize rotated video:\n{exc}"
+            )
+
+        finally:
+            self._set_rotate_buttons_enabled(True)
+            if process is not None:
+                process.deleteLater()
+
+    def rotate_selected_media(self, angle: int) -> None:
+        selected_paths = self.selected_file_paths()
+        if len(selected_paths) != 1:
+            QMessageBox.information(
+                self,
+                "Rotate",
+                "Please select exactly one image or video file."
+            )
+            return
+
+        path = selected_paths[0]
+
+        try:
+            if self._is_rotatable_image(path):
+                self._set_rotate_buttons_enabled(False)
+                try:
+                    self._rotate_image_file(path, angle)
+                    self.thumbnail_cache.pop(path, None)
+                    self.show_preview(path)
+                    self.populate_details_panel(path)
+                    if self.info_panel_visible:
+                        self.populate_info_panel(path)
+                finally:
+                    self._set_rotate_buttons_enabled(True)
+
+            elif self._is_rotatable_video(path):
+                self._start_video_rotation(path, angle)
+
+            else:
+                QMessageBox.information(
+                    self,
+                    "Rotate",
+                    "Selected file type is not supported for rotation."
+                )
+                return
+
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Rotate",
+                f"Could not rotate file:\n{exc}"
+            )
+
+    def _on_rotate_process_stderr(self) -> None:
+        if self.rotate_process is None:
+            return
+
+        data = bytes(self.rotate_process.readAllStandardError()).decode("cp1254", errors="ignore")
+        if not data:
+            return
+
+        self.rotate_stderr_buffer += data
+
+        while "\n" in self.rotate_stderr_buffer:
+            line, self.rotate_stderr_buffer = self.rotate_stderr_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+
+            # Duration: 00:01:23.45
+            if "Duration:" in line and self.rotate_duration_ms is None:
+                try:
+                    part = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+                    self.rotate_duration_ms = self._hhmmss_to_ms(part)
+                except Exception:
+                    pass
+
+            # ffmpeg -progress çıktısı: out_time_ms=...
+            elif line.startswith("out_time_ms="):
+                try:
+                    out_time_ms = int(line.split("=", 1)[1].strip())
+                    if self.rotate_duration_ms and self.rotate_duration_ms > 0:
+                        percent = max(0, min(100, int(out_time_ms * 100 / self.rotate_duration_ms)))
+                        if self.rotate_target_path is not None:
+                            self.statusBar().showMessage(
+                                f"Rotating video: {self.rotate_target_path.name} ... {percent}%"
+                            )
+                    else:
+                        if self.rotate_target_path is not None:
+                            self.statusBar().showMessage(
+                                f"Rotating video: {self.rotate_target_path.name} ..."
+                            )
+                except Exception:
+                    pass
+
+            elif line.startswith("progress=end"):
+                if self.rotate_target_path is not None:
+                    self.statusBar().showMessage(
+                        f"Finalizing video rotation: {self.rotate_target_path.name} ..."
+                    )
 
     def apply_row_filters(self) -> None:
         self.media_table_model.set_rows(list(self.all_media_rows))
@@ -544,6 +1282,8 @@ class MainWindow(QMainWindow):
         else:
             self.preview_info_splitter.setSizes([1000, 0])
 
+        self._update_info_toggle_button()
+        self._position_overlay_buttons()
 
     def populate_info_panel(self, path: Path) -> None:
         self.info_name_label.setText(path.name)
@@ -556,6 +1296,32 @@ class MainWindow(QMainWindow):
         except Exception:
             self.info_size_label.setText("")
 
+        exif_dates = read_exiftool_date_fields([path]).get(path, {})
+
+        self.info_exif_datetimeoriginal_label.setText(exif_dates.get("DateTimeOriginal") or "")
+        self.info_exif_createdate_label.setText(exif_dates.get("CreateDate") or "")
+        self.info_exif_mediacreatedate_label.setText(exif_dates.get("MediaCreateDate") or "")
+        self.info_exif_trackcreatedate_label.setText(exif_dates.get("TrackCreateDate") or "")
+        self.info_exif_creationdate_label.setText(exif_dates.get("CreationDate") or "")
+        self.info_exif_modifydate_label.setText(exif_dates.get("ModifyDate") or "")
+        self.info_exif_filemodifydate_label.setText(exif_dates.get("FileModifyDate") or "")
+        
+        is_image = self._is_image_file(path)
+        is_video = self._is_video_file(path)
+
+        # Resimlerde daha anlamlı olan alanlar
+        self._set_info_row_visible(self.info_form, self.info_exif_datetimeoriginal_label, is_image)
+        self._set_info_row_visible(self.info_form, self.info_exif_creationdate_label, is_image or is_video)
+
+        # Videolarda daha sık görülen alanlar
+        self._set_info_row_visible(self.info_form, self.info_exif_mediacreatedate_label, is_video)
+        self._set_info_row_visible(self.info_form, self.info_exif_trackcreatedate_label, is_video)
+
+        # Her iki türde de görülebilecek genel alanlar
+        self._set_info_row_visible(self.info_form, self.info_exif_createdate_label, True)
+        self._set_info_row_visible(self.info_form, self.info_exif_modifydate_label, True)
+        self._set_info_row_visible(self.info_form, self.info_exif_filemodifydate_label, True)
+        
         dates = self.get_dates_for_path(path)
         self.info_metadata_date_label.setText(self._fmt_year_month(dates.get("metadata")))
         self.info_filename_date_label.setText(self._fmt_year_month(dates.get("filename")))
@@ -597,6 +1363,13 @@ class MainWindow(QMainWindow):
             self.ui_options = dlg.build_options()
             self.apply_column_settings()
             self.refresh_selected_folders()
+
+
+    def show_duplicate_options_dialog(self) -> None:
+        dialog = DuplicateOptionsDialog(self.ui_options.duplicate_files, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.ui_options.duplicate_files = dialog.build_options()
+            self.statusBar().showMessage("Duplicate file options updated.", 3000)
 
     def move_priority_item(self, delta: int) -> None:
         row = self.priority_list.currentRow()
@@ -803,6 +1576,10 @@ class MainWindow(QMainWindow):
         self.set_folder(Path(folder))
 
     def set_folder(self, folder: Path) -> None:
+        if self.rotate_process is not None:
+            QMessageBox.information(self, "Rotate", "Please wait until the current video rotation finishes.")
+            return
+        
         self.current_folder = folder
         self.thumbnail_cache.clear()
         self.current_preview_video_path = None
@@ -885,11 +1662,21 @@ class MainWindow(QMainWindow):
         self.scan_selected_folders(self.folder_list.selected_folder_paths())
 
     def _cleanup_scan_thread(self) -> None:
-        if self.scan_thread is not None:
-            self.scan_thread.quit()
-            self.scan_thread.wait()
-            self.scan_thread = None
-            self.scanner = None
+        old_thread = self.scan_thread
+        old_scanner = self.scanner
+
+        self.scan_thread = None
+        self.scanner = None
+
+        if old_thread is not None:
+            old_thread.quit()
+            old_thread.wait()
+
+        if old_scanner is not None:
+            old_scanner.deleteLater()
+
+        if old_thread is not None:
+            old_thread.deleteLater()
 
     def on_scan_progress(self, current: int, total: int) -> None:
         if total > 0:
@@ -948,24 +1735,37 @@ class MainWindow(QMainWindow):
         scanner.progress_changed.connect(self.on_scan_progress)
 
         paths_str = [str(p) for p in selected_paths]
+        try:
+            self.request_scan.disconnect()
+        except Exception:
+            pass
+
         self.request_scan.connect(scanner.scan_folders)
 
         scanner.scan_finished.connect(self.on_scan_finished)
         scanner.scan_failed.connect(self.on_scan_failed)
         scanner.scan_finished.connect(self.scan_thread.quit)
         scanner.scan_failed.connect(self.scan_thread.quit)
-        self.scan_thread.finished.connect(self._on_scan_thread_finished)
+        
+        thread = self.scan_thread
+        worker = scanner
+        thread.finished.connect(lambda: self._on_scan_thread_finished(thread, worker))
 
         self.scan_thread.start()
         self.request_scan.emit(paths_str, recursive, scan_limit, self.ui_options)
 
-    def _on_scan_thread_finished(self) -> None:
-        if self.scanner is not None:
-            self.scanner.deleteLater()
+    def _on_scan_thread_finished(self, thread: QThread, worker) -> None:
+        if worker is self.scanner:
             self.scanner = None
-        if self.scan_thread is not None:
-            self.scan_thread.deleteLater()
+
+        if thread is self.scan_thread:
             self.scan_thread = None
+
+        if worker is not None:
+            worker.deleteLater()
+
+        if thread is not None:
+            thread.deleteLater()
 
     def on_scan_finished(self, rows) -> None:
         if self.current_folder is not None:
@@ -982,33 +1782,21 @@ class MainWindow(QMainWindow):
 
         self.all_media_rows = rows
         self.apply_row_filters()
-        
+
         self.statusBar().showMessage(f"Loaded {len(rows)} media files.")
         self.preview_label.setText("Preview")
         self.preview_label.setPixmap(QPixmap())
         self.show_play_overlay(False)
         self.current_preview_video_path = None
         self.clear_details_panel()
+
         if self.media_proxy_model.rowCount() > 0:
+            self.media_table.clearSelection()
             self.media_table.selectRow(0)
-
-            proxy_index = self.media_proxy_model.index(0, 0)
-            source_index = self.media_proxy_model.mapToSource(proxy_index)
-
-            if source_index.isValid():
-                first_rel_path = self.media_table_model.get_path(source_index.row())
-                if first_rel_path is not None:
-                    if self.current_folder is not None and not first_rel_path.is_absolute():
-                        first_path = self.current_folder / first_rel_path
-                    else:
-                        first_path = first_rel_path
-
-                    self.current_info_path = first_path
-                    self.show_preview(first_path)
-                    self.populate_details_panel(first_path)
-                    self.selection_count_label.setText("1 files are selected.")
-
-            self.on_media_selection_changed()
+        else:
+            self.selection_count_label.setText("You have not selected a file")
+            
+            
 
     def on_scan_failed(self, msg: str) -> None:
         QMessageBox.critical(self, "Error", msg)
@@ -1037,7 +1825,7 @@ class MainWindow(QMainWindow):
 
         return paths
 
-    def on_media_selection_changed(self) -> None:
+    def on_media_selection_changed(self, selected=None, deselected=None) -> None:
         selected_paths = self.selected_file_paths()
         count = len(selected_paths)
         if count == 0:
@@ -1138,9 +1926,52 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            target_path = old_path.with_name(new_name)
-            if target_path.exists():
-                raise FileExistsError(f"File already exists: {target_path.name}")
+            dest_dir = old_path.parent
+            target_path = None
+
+            dup_options = self.ui_options.duplicate_files
+            if duplicate_scope_applies(dup_options, "rename", old_path):
+                decision = resolve_duplicate_for_destination(
+                    source_path=old_path,
+                    dest_dir=dest_dir,
+                    preferred_name=new_name,
+                    options=dup_options,
+                )
+
+                rename_action, duplicate_target_path = self._handle_duplicate_decision_for_rename(
+                    decision,
+                    old_path,
+                )
+
+                if rename_action == "skip":
+                    self.statusBar().showMessage(f"Rename skipped for: {old_path.name}")
+                    self.refresh_selected_folders()
+                    return
+
+                if rename_action == "rename" and duplicate_target_path is not None:
+                    target_path = duplicate_target_path
+
+            if target_path is None:
+                target_path, collision_action = resolve_destination_path(
+                    dest_dir,
+                    new_name,
+                    old_path.stat().st_size,
+                )
+
+                if target_path is None:
+                    self.statusBar().showMessage(f"Rename skipped for: {old_path.name}")
+                    self.refresh_selected_folders()
+                    return
+
+            same_path = False
+            try:
+                same_path = old_path.resolve() == target_path.resolve()
+            except Exception:
+                pass
+
+            if same_path:
+                self.refresh_selected_folders()
+                return
 
             new_path = old_path.rename(target_path)
 
@@ -1150,6 +1981,7 @@ class MainWindow(QMainWindow):
                 self.refresh_selected_folders()
 
             self.statusBar().showMessage(f"File renamed to: {new_path.name}")
+
         except Exception as exc:
             QMessageBox.warning(self, "Rename File", f"Could not rename file:\n{exc}")
             self.refresh_selected_folders()
@@ -1233,11 +2065,13 @@ class MainWindow(QMainWindow):
 
     def show_play_overlay(self, visible: bool) -> None:
         if visible:
-            self.position_play_overlay()
+            self._position_play_overlay_button()
             self.play_overlay_button.show()
             self.play_overlay_button.raise_()
         else:
             self.play_overlay_button.hide()
+
+        self._update_info_toggle_button()
 
     def open_current_video(self) -> None:
         if self.current_preview_video_path is None:
@@ -1257,9 +2091,12 @@ class MainWindow(QMainWindow):
         if cached is not None and cached.exists():
             return cached
 
-        thumb = self._extract_video_thumbnail_with_exiftool(path)
+        # Önce gerçek videodan yeni kare al
+        thumb = self._extract_video_frame_with_ffmpeg(path)
+
+        # Olmazsa gömülü thumbnail'e düş
         if thumb is None:
-            thumb = self._extract_video_frame_with_ffmpeg(path)
+            thumb = self._extract_video_thumbnail_with_exiftool(path)
 
         self.thumbnail_cache[path] = thumb
         return thumb
@@ -1269,15 +2106,10 @@ class MainWindow(QMainWindow):
             safe_name = f"media_thumb_{abs(hash(str(path)))}.jpg"
             thumb_path = Path(tempfile.gettempdir()) / safe_name
 
-            cmd = [
-                "exiftool",
-                "-b",
-                "-ThumbnailImage",
-                str(path),
-            ]
+            cmd = exiftool_base_cmd("-b", "-ThumbnailImage", str(path))
 
             with open(thumb_path, "wb") as f:
-                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, check=False)
 
             if result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
                 return thumb_path
@@ -1298,7 +2130,7 @@ class MainWindow(QMainWindow):
                 "00:00:01",
                 "-i",
                 str(path),
-                "-vframes",
+                "-frames:v",
                 "1",
                 str(thumb_path),
             ]
@@ -1308,6 +2140,8 @@ class MainWindow(QMainWindow):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="cp1254",
+                errors="replace",
             )
 
             if result.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0:
@@ -1318,6 +2152,9 @@ class MainWindow(QMainWindow):
         return None
 
     def show_preview(self, path: Path) -> None:
+        self.rotate_ccw_button.show()
+        self.rotate_cw_button.show()
+        self._position_rotate_buttons()    
         ext = path.suffix.lower()
         self.current_preview_video_path = None
         self.show_play_overlay(False)
@@ -1333,6 +2170,8 @@ class MainWindow(QMainWindow):
                 pixmap.scaled(500, 420, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
             self.preview_label.setText("")
+            self.rotate_ccw_button.show()
+            self.rotate_cw_button.show()            
             return
 
         if ext in self.VIDEO_EXTENSIONS:
@@ -1347,6 +2186,8 @@ class MainWindow(QMainWindow):
                     self.preview_label.setText("")
                     self.current_preview_video_path = path
                     self.show_play_overlay(True)
+                    self.rotate_ccw_button.show()
+                    self.rotate_cw_button.show()                    
                     return
 
             self.preview_label.setPixmap(QPixmap())
@@ -1492,6 +2333,7 @@ class MainWindow(QMainWindow):
 
         errors: list[str] = []
         copied_count = 0
+        skipped_count = 0
 
         for source_path in selected_paths:
             try:
@@ -1509,14 +2351,39 @@ class MainWindow(QMainWindow):
                 if do_filename:
                     dest_name = self.build_updated_filename(dest_name, target_dt)
 
-                dest_path, _ = resolve_destination_path(
-                    dest_dir,
-                    dest_name,
-                    source_path.stat().st_size,
-                )
+                dest_path = None
+
+                dup_options = self.ui_options.duplicate_files
+                if duplicate_scope_applies(dup_options, "copy", source_path):
+                    decision = resolve_duplicate_for_destination(
+                        source_path=source_path,
+                        dest_dir=dest_dir,
+                        preferred_name=dest_name,
+                        options=dup_options,
+                    )
+
+                    copy_action, duplicate_target_path = self._handle_duplicate_decision_for_copy(
+                        decision,
+                        source_path,
+                    )
+
+                    if copy_action == "skip":
+                        skipped_count += 1
+                        continue
+
+                    if copy_action == "copy" and duplicate_target_path is not None:
+                        dest_path = duplicate_target_path
 
                 if dest_path is None:
-                    dest_path = dest_dir / dest_name
+                    dest_path, collision_action = resolve_destination_path(
+                        dest_dir,
+                        dest_name,
+                        source_path.stat().st_size,
+                    )
+
+                    if dest_path is None:
+                        skipped_count += 1
+                        continue
 
                 shutil.copy2(str(source_path), str(dest_path))
 
@@ -1534,9 +2401,16 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.warning(self, "Copy completed with errors", "\n".join(errors[:20]))
         else:
-            QMessageBox.information(self, "Copy", f"{copied_count} file(s) copied successfully.")
+            QMessageBox.information(
+                self,
+                "Copy",
+                f"{copied_count} file(s) copied successfully.\n"
+                f"{skipped_count} file(s) skipped."
+            )
 
-        self.statusBar().showMessage(f"{copied_count} file(s) copied to {target_root}")
+        self.statusBar().showMessage(
+            f"{copied_count} file(s) copied to {target_root}, {skipped_count} skipped."
+        )
 
     def update_selected_files(self) -> None:
         selected_paths = self.selected_file_paths()
@@ -1571,39 +2445,77 @@ class MainWindow(QMainWindow):
         errors: list[str] = []
         old_paths: list[Path] = []
         new_paths: list[Path] = []
+        updated_count = 0
+        skipped_count = 0
 
         for source_path in selected_paths:
             old_paths.append(source_path)
+
             try:
                 current_path = source_path
-                dates = self.get_dates_for_path(source_path)
-                target_dt, _source_key = self.choose_date_by_priority(dates)
+                target_dt = datetime(year, month, 1, 12, 0, 0)
 
-                if target_dt is None:
-                    errors.append(f"{source_path.name}: no usable date found")
-                    continue
-
+                target_name = current_path.name
                 if do_filename:
-                    new_name = self.build_updated_filename(current_path.name, target_dt)
-                    if new_name != current_path.name:
-                        dest_path, _ = resolve_destination_path(
-                            current_path.parent,
-                            new_name,
+                    target_name = self.build_updated_filename(target_name, target_dt)
+
+                target_folder = current_path.parent
+                if do_folder:
+                    target_folder = self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}"
+
+                target_path = current_path
+
+                # move veya rename gerekiyorsa önce hedef yolu çöz
+                if do_folder or do_filename:
+                    resolved_target_path = None
+
+                    dup_options = self.ui_options.duplicate_files
+
+                    if do_folder and duplicate_scope_applies(dup_options, "move", current_path):
+                        decision = resolve_duplicate_for_destination(
+                            source_path=current_path,
+                            dest_dir=target_folder,
+                            preferred_name=target_name,
+                            options=dup_options,
+                        )
+
+                        move_action, duplicate_target_path = self._handle_duplicate_decision_for_move(
+                            decision,
+                            current_path,
+                        )
+
+                        if move_action == "skip":
+                            skipped_count += 1
+                            new_paths.append(current_path)
+                            continue
+
+                        if move_action == "move" and duplicate_target_path is not None:
+                            resolved_target_path = duplicate_target_path
+
+                    if resolved_target_path is None:
+                        resolved_target_path, collision_action = resolve_destination_path(
+                            target_folder,
+                            target_name,
                             current_path.stat().st_size,
                         )
-                        if dest_path is not None and dest_path != current_path:
-                            current_path = current_path.rename(dest_path)
 
-                if do_folder and self.current_folder is not None:
-                    target_folder = self.current_folder / f"{target_dt.year:04d}" / f"{target_dt.month:02d}"
-                    target_folder.mkdir(parents=True, exist_ok=True)
-                    dest_path, _ = resolve_destination_path(
-                        target_folder,
-                        current_path.name,
-                        current_path.stat().st_size,
-                    )
-                    if dest_path is not None and dest_path != current_path:
-                        current_path = Path(shutil.move(str(current_path), str(dest_path)))
+                        if resolved_target_path is None:
+                            skipped_count += 1
+                            new_paths.append(current_path)
+                            continue
+
+                    same_path = False
+                    try:
+                        same_path = current_path.resolve() == resolved_target_path.resolve()
+                    except Exception:
+                        pass
+
+                    if not same_path:
+                        if resolved_target_path.parent != current_path.parent:
+                            resolved_target_path.parent.mkdir(parents=True, exist_ok=True)
+                            current_path = Path(shutil.move(str(current_path), str(resolved_target_path)))
+                        else:
+                            current_path = current_path.rename(resolved_target_path)
 
                 if do_metadata:
                     self.write_metadata(current_path, target_dt)
@@ -1612,9 +2524,11 @@ class MainWindow(QMainWindow):
                     self.write_filesystem_time(current_path, target_dt)
 
                 new_paths.append(current_path)
+                updated_count += 1
 
             except Exception as exc:
                 errors.append(f"{source_path.name}: {exc}")
+                new_paths.append(source_path)
 
         if len(old_paths) <= 50:
             self.incremental_refresh_files(old_paths, new_paths)
@@ -1624,7 +2538,16 @@ class MainWindow(QMainWindow):
         if errors:
             QMessageBox.warning(self, "Update completed with errors", "\n".join(errors[:20]))
         else:
-            QMessageBox.information(self, "Update", "Selected files updated successfully.")
+            QMessageBox.information(
+                self,
+                "Update",
+                f"{updated_count} file(s) updated successfully.\n"
+                f"{skipped_count} file(s) skipped."
+            )
+            
+        self.statusBar().showMessage(
+            f"{updated_count} file(s) updated, {skipped_count} skipped."
+        )
 
     def build_updated_filename(self, original_name: str, target_dt: datetime) -> str:
         import re
@@ -1686,7 +2609,7 @@ class MainWindow(QMainWindow):
     def write_metadata(self, path: Path, dt: datetime) -> None:
         dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
 
-        cmd = ["exiftool", "-overwrite_original"]
+        cmd = exiftool_base_cmd("-overwrite_original")
 
 
         if self._is_image_file(path):
@@ -1715,7 +2638,7 @@ class MainWindow(QMainWindow):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding="utf-8",
+            encoding="cp1254",
             errors="replace",
         )
 
@@ -1729,6 +2652,11 @@ class MainWindow(QMainWindow):
             raise RuntimeError(message)
 
     def write_filesystem_time(self, path: Path, dt: datetime) -> None:
+        # Aware datetime gelirse önce local naive datetime'a çevir.
+        # Böylece Windows FILETIME hesabında naive/aware çakışması olmaz.
+        if dt.tzinfo is not None and dt.utcoffset() is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+
         if sys.platform.startswith("win"):
             import ctypes
             import ctypes.wintypes as wintypes
@@ -1762,9 +2690,9 @@ class MainWindow(QMainWindow):
 
             ok = ctypes.windll.kernel32.SetFileTime(
                 handle,
-                ctypes.byref(ft),  # creation time
-                ctypes.byref(ft),  # access time
-                ctypes.byref(ft),  # write time
+                ctypes.byref(ft),  # creation
+                ctypes.byref(ft),  # access
+                ctypes.byref(ft),  # write
             )
             ctypes.windll.kernel32.CloseHandle(handle)
 
@@ -1777,7 +2705,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.position_play_overlay()
+        self._position_overlay_buttons()
 
     def closeEvent(self, event) -> None:
         self._cleanup_scan_thread()

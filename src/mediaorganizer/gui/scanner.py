@@ -120,7 +120,7 @@ class FolderScanner(QObject):
                     for filename in filenames:
                         p = Path(root) / filename
                         if is_supported_media_file(p):
-                            resolved = p.resolve()
+                            resolved = p.resolve(strict=False)
                             if resolved not in seen:
                                 seen.add(resolved)
                                 result.append(p)
@@ -129,7 +129,7 @@ class FolderScanner(QObject):
             else:
                 for p in folder.iterdir():
                     if p.is_file() and is_supported_media_file(p):
-                        resolved = p.resolve()
+                        resolved = p.resolve(strict=False)
                         if resolved not in seen:
                             seen.add(resolved)
                             result.append(p)

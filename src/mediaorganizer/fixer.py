@@ -6,7 +6,7 @@ import sys
 
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple
 
 from .consistency import (
@@ -17,7 +17,13 @@ from .consistency import (
 from .metadata_reader import read_metadata_dates_with_exiftool
 from .naming import resolve_destination_path
 from .logging_utils import vprint
+from .exiftool_utils import exiftool_run_with_files
 
+
+def _to_local_naive_datetime(dt: datetime) -> datetime:
+    if dt.tzinfo is not None and dt.utcoffset() is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
 
 def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
     """
@@ -27,6 +33,8 @@ def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
     - Windows'ta creation time
     """
     try:
+        dt = _to_local_naive_datetime(dt)
+
         ts = dt.timestamp()
 
         # mtime ve atime
@@ -38,18 +46,19 @@ def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
             import ctypes.wintypes as wintypes
 
             FILE_WRITE_ATTRIBUTES = 0x0100
+            OPEN_EXISTING = 3
 
             handle = ctypes.windll.kernel32.CreateFileW(
                 str(file_path),
                 FILE_WRITE_ATTRIBUTES,
                 0,
                 None,
-                3,
+                OPEN_EXISTING,
                 0,
                 None
             )
 
-            if handle == -1:
+            if handle == -1 or handle == 0:
                 return False, "CreateFile failed"
 
             # Windows FILETIME = 100-nanosecond intervals since Jan 1, 1601
@@ -63,7 +72,7 @@ def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
 
             ft = wintypes.FILETIME(low, high)
 
-            ctypes.windll.kernel32.SetFileTime(
+            ok = ctypes.windll.kernel32.SetFileTime(
                 handle,
                 ctypes.byref(ft),  # creation
                 ctypes.byref(ft),  # access
@@ -72,6 +81,9 @@ def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
 
             ctypes.windll.kernel32.CloseHandle(handle)
 
+            if not ok:
+                return False, "SetFileTime failed"
+
         return True, ""
 
     except Exception as e:
@@ -79,28 +91,21 @@ def set_filesystem_times(file_path: Path, dt: datetime) -> Tuple[bool, str]:
 
 
 def write_metadata_with_exiftool(file_path: Path, dt: datetime, verbose=False) -> Tuple[bool, str]:
-    """
-    ExifTool ile metadata tarihlerini günceller.
-    """
     dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
 
-    cmd = [
-        "exiftool",
-        "-overwrite_original",
-        f"-DateTimeOriginal={dt_str}",
-        f"-CreateDate={dt_str}",
-        f"-ModifyDate={dt_str}",
-        f"-MediaCreateDate={dt_str}",
-        f"-TrackCreateDate={dt_str}",
-        str(file_path)
-    ]
-
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        result = exiftool_run_with_files(
+            [
+                "-overwrite_original",
+                f"-DateTimeOriginal={dt_str}",
+                f"-CreateDate={dt_str}",
+                f"-ModifyDate={dt_str}",
+                f"-MediaCreateDate={dt_str}",
+                f"-TrackCreateDate={dt_str}",
+            ],
+            [file_path],
+            check=False,
+            text=True,
         )
 
         if result.returncode == 0:

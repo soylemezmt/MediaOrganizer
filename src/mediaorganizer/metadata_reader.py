@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Any
 
 from .date_parsing import parse_date_string
 from .config import EXIFTOOL_DATE_TAGS
+from .exiftool_utils import exiftool_run, exiftool_run_with_files
 
 
 def chunked(lst: List[Path], size: int):
@@ -15,15 +16,7 @@ def chunked(lst: List[Path], size: int):
 
 def _probe_exiftool() -> bool:
     try:
-        probe = subprocess.run(
-            ["exiftool", "-ver"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        probe = exiftool_run(["-ver"], check=False, text=True)
         return probe.returncode == 0
     except Exception:
         return False
@@ -39,28 +32,24 @@ def read_metadata_dates_with_exiftool(
         return result
 
     for group in chunked(files, 100):
-        cmd = [
-            "exiftool",
-            "-j",
-            "-n",
-            "-DateTimeOriginal",
-            "-CreateDate",
-            "-MediaCreateDate",
-            "-TrackCreateDate",
-            "-CreationDate",
-            "-ModifyDate",
-            "-FileModifyDate",
-        ] + [str(f) for f in group]
+        
 
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            proc = exiftool_run_with_files(
+                [
+                    "-j",
+                    "-n",
+                    "-DateTimeOriginal",
+                    "-CreateDate",
+                    "-MediaCreateDate",
+                    "-TrackCreateDate",
+                    "-CreationDate",
+                    "-ModifyDate",
+                    "-FileModifyDate",
+                ],
+                group,
                 check=False,
+                text=True,
             )
 
             if proc.stderr.strip():
@@ -116,6 +105,7 @@ def read_location_fields_with_exiftool(files: List[Path]) -> Dict[Path, Dict[str
     for group in chunked(files, 100):
         cmd = [
             "exiftool",
+            "-charset", "filename=cp1254",
             "-j",
             "-n",
             "-Country",
@@ -132,7 +122,7 @@ def read_location_fields_with_exiftool(files: List[Path]) -> Dict[Path, Dict[str
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                encoding="utf-8",
+                encoding="cp1254",
                 errors="replace",
                 check=False,
             )
@@ -160,5 +150,67 @@ def read_location_fields_with_exiftool(files: List[Path]) -> Dict[Path, Dict[str
                 "gps_lat": item.get("GPSLatitude"),
                 "gps_lon": item.get("GPSLongitude"),
             }
+
+    return result
+
+def read_exiftool_date_fields(files: List[Path]) -> Dict[Path, Dict[str, Optional[str]]]:
+    result: Dict[Path, Dict[str, Optional[str]]] = {
+        f: {
+            "DateTimeOriginal": None,
+            "CreateDate": None,
+            "MediaCreateDate": None,
+            "TrackCreateDate": None,
+            "CreationDate": None,
+            "ModifyDate": None,
+            "FileModifyDate": None,
+        }
+        for f in files
+    }
+
+    if not files or not _probe_exiftool():
+        return result
+
+    for group in chunked(files, 100):
+
+        try:
+            proc = exiftool_run_with_files(
+                [
+                    "-j",
+                    "-DateTimeOriginal",
+                    "-CreateDate",
+                    "-MediaCreateDate",
+                    "-TrackCreateDate",
+                    "-CreationDate",
+                    "-ModifyDate",
+                    "-FileModifyDate",
+                ],
+                group,
+                check=False,
+                text=True,
+            )
+
+            if proc.stderr.strip():
+                print(f"UYARI: exiftool stderr: {proc.stderr.strip()}")
+
+            if not proc.stdout.strip():
+                continue
+
+            data = json.loads(proc.stdout)
+        except Exception as e:
+            print(f"UYARI: exiftool detay tarih okuma hatası: {e}")
+            continue
+
+        for item in data:
+            src = item.get("SourceFile")
+            if not src:
+                continue
+
+            p = Path(src)
+            if p not in result:
+                continue
+
+            for tag in result[p].keys():
+                value = item.get(tag)
+                result[p][tag] = "" if value is None else str(value)
 
     return result

@@ -10,7 +10,6 @@ def resolve_destination_path(dest_dir: Path, original_name: str, source_size: in
     Aynı isim ve aynı boyut varsa None döner -> skip
     Aynı isim ama farklı boyut varsa _01, _02 ekler
     """
-    dest_dir.mkdir(parents=True, exist_ok=True)
 
     base = Path(original_name).stem
     ext = Path(original_name).suffix
